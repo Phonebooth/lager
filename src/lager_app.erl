@@ -77,6 +77,8 @@ start(_StartType, _StartArgs) ->
 
     ok = add_configured_traces(),
 
+    ok = add_configured_trace_files(),
+
     %% mask the messages we have no use for
     lager:update_loglevel_config(),
 
@@ -149,6 +151,19 @@ add_configured_traces() ->
                 {ok, _} = lager:trace(Handler, Filter, Level)
         end,
         Traces),
+    ok.
+
+add_configured_trace_files() ->
+    TraceFiles = case application:get_env(lager, tracefiles) of
+        undefined ->
+            [];
+        {ok, TraceFileVal} ->
+            TraceFileVal
+    end, 
+
+    lists:foreach(fun({Handler, Filter, Level}) ->
+                    {ok, _} = lager:trace_file(Handler, Filter, Level)
+                  end, TraceFiles),
     ok.
 
 maybe_make_handler_id(Mod, Config) ->
