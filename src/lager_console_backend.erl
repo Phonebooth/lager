@@ -88,6 +88,9 @@ handle_call(_Request, State) ->
     {ok, ok, State}.
 
 %% @private
+handle_event({log, {lager_msg, _Dest, _Metadata, trace, _DateTime, _Timestamp, _Content}}, State) ->
+    %% Trace messages con contain binary data that causes io:put_chars to crash
+    {ok, State};
 handle_event({log, Message},
     #state{level=L,formatter=Formatter,format_config=FormatConfig,colors=Colors} = State) ->
     case lager_util:is_loggable(Message, L, ?MODULE) of
