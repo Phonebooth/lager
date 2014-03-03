@@ -76,9 +76,7 @@ do_log(_Msg={lager_msg, _Dest, Metadata, Severity, _DateTime, Timestamp, Content
         State=#state{level=Severity, socket=Socket, formatter=Formatter}) ->
     case format(Formatter, Metadata, Timestamp, Content) of
         Bin when is_binary(Bin) ->
-            Size = size(Bin),
-            Packet = <<Size:32, Bin/binary>>,
-            case gen_tcp:send(Socket, Packet) of
+            case gen_tcp:send(Socket, Bin) of
                 {error, timeout} ->
                     %% Usually, it's a good idea to give up in case of a 
                     %% send timeout, as you never know how much actually 
@@ -110,7 +108,7 @@ connect_tcp_socket(State=#state{host=Host, port=Port, socket=undefined}) ->
                                         {nodelay, true},
                                         {send_timeout, 500}
                                     ], 5000) of
-        {error, Error} ->
+        {error, _Error} ->
             %lager:error("unable to connect to microtrace host: ~p port: ~p error: ~p", [Host, Port, Error]),
             timed_reconnect(?RECONNECT_TIMEOUT),
             State;
