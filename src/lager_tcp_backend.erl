@@ -10,6 +10,8 @@
         code_change/3
     ]).
 
+-include("../include/lager.hrl").
+
 -compile([{parse_transform, lager_transform}]).
 
 -record(state, {level, formatter, host, port, socket}).
@@ -17,7 +19,7 @@
 -define(RECONNECT_TIMEOUT, 5000).
 
 init(Config) ->
-    Level = proplists:get_value(level, Config, trace),
+    Level = proplists:get_value(level, Config, utrace),
     Formatter = proplists:get_value(formatter, Config, undefined),
     Host = proplists:get_value(host, Config, "localhost"),
     Port = proplists:get_value(port, Config, 62785),

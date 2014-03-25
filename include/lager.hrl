@@ -19,10 +19,10 @@
 -define(DEFAULT_TRACER, lager_default_tracer).
 
 -define(LEVELS,
-    [trace, debug, info, notice, warning, error, critical, alert, emergency, none]).
+    [debug, utrace, info, notice, warning, error, critical, alert, emergency, none]).
 
--define(TRACE, 256).
--define(DEBUG, 128).
+-define(DEBUG, 256).
+-define(UTRACE, 128).
 -define(INFO, 64).
 -define(NOTICE, 32).
 -define(WARNING, 16).
@@ -34,8 +34,8 @@
 
 -define(LEVEL2NUM(Level),
     case Level of
-        trace -> ?TRACE;
         debug -> ?DEBUG;
+        utrace -> ?UTRACE;
         info -> ?INFO;
         notice -> ?NOTICE;
         warning -> ?WARNING;
@@ -47,8 +47,8 @@
 
 -define(NUM2LEVEL(Num),
     case Num of
-        ?TRACE -> trace;
         ?DEBUG -> debug;
+        ?UTRACE -> utrace;
         ?INFO -> info;
         ?NOTICE -> notice;
         ?WARNING -> warning;

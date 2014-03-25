@@ -133,6 +133,9 @@ handle_call(_Request, State) ->
     {ok, ok, State}.
 
 %% @private
+handle_event({log, {lager_msg, _Dest, _Metadata, utrace, _DateTime, _Timestamp, _Content}}, State) ->
+    %% utrace messages shouldn't be logged to a file
+    {ok, State};
 handle_event({log, Message},
     #state{name=Name, level=L,formatter=Formatter,formatter_config=FormatConfig} = State) ->
     case lager_util:is_loggable(Message,L,{lager_file_backend, Name}) of
