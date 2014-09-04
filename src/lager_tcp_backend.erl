@@ -35,7 +35,7 @@ handle_call({set_loglevel, Level}, State=#state{}) ->
     {ok, ok, State#state{level=Level}};
     
 handle_call(get_loglevel, State=#state{level=Level}) ->
-    {ok, Level, State};
+    {ok, lager_util:level_to_num(Level), State};
 
 handle_call({set_formatter, Formatter}, State) ->
     {ok, ok, State#state{formatter=Formatter}};
