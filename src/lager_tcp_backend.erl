@@ -25,17 +25,28 @@ init(Config) ->
     Port = proplists:get_value(port, Config, 62785),
     lager:info("level=~p, formatter=~p, host=~p, port=~p", [Level, Formatter, Host, Port]),
     State = #state{
-        level=Level,
+        level=normalize_level(Level),
         formatter=Formatter, 
         host=Host,
         port=Port},
     {ok, connect_tcp_socket(State)}.
 
+% We use a mask tuple for the level because we only care about
+% logs strictly equal to our level.
+normalize_level(Level) when is_atom(Level) ->
+    {mask, lager_util:level_to_num(Level)};
+normalize_level(Level={mask,M}) when is_integer(M) ->
+    Level;
+normalize_level({mask,M}) when is_atom(M) ->
+    {mask, lager_util:level_to_num(M)};
+normalize_level(Level) when is_integer(Level) ->
+    {mask, Level}.
+
 handle_call({set_loglevel, Level}, State=#state{}) ->
-    {ok, ok, State#state{level=Level}};
+    {ok, ok, State#state{level=normalize_level(Level)}};
     
 handle_call(get_loglevel, State=#state{level=Level}) ->
-    {ok, lager_util:level_to_num(Level), State};
+    {ok, Level, State};
 
 handle_call({set_formatter, Formatter}, State) ->
     {ok, ok, State#state{formatter=Formatter}};
@@ -47,7 +58,7 @@ handle_call(_Request, State) ->
     {ok, ok, State}.
 
 handle_event({log, Msg}, State=#state{level=Level, socket=Socket}) when Socket =/= undefined ->
-    case lager_util:is_loggable(Msg, lager_util:level_to_num(Level), ?MODULE) of
+    case lager_util:is_loggable(Msg, Level, ?MODULE) of
         true ->
             {ok, do_log(Msg, State)};
         _ ->
@@ -74,8 +85,8 @@ code_change(_OldVsn, State, _Extra) ->
 
 do_log(_Msg, State=#state{socket=undefined}) ->
     State;
-do_log(_Msg={lager_msg, _Dest, Metadata, Severity, _DateTime, Timestamp, Content}, 
-        State=#state{level=Severity, socket=Socket, formatter=Formatter}) ->
+do_log(_Msg={lager_msg, _Dest, Metadata, _Severity, _DateTime, Timestamp, Content}, 
+        State=#state{socket=Socket, formatter=Formatter}) ->
     case format(Formatter, Metadata, Timestamp, Content) of
         Bin when is_binary(Bin) ->
             case gen_tcp:send(Socket, Bin) of
