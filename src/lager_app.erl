@@ -54,8 +54,10 @@ start(_StartType, _StartArgs) ->
                           "Invalid value for 'async_threshold_window': ~p~n", [BadWindow]),
                         throw({error, bad_config})
                 end,
+            {SieveThreshold, SieveWindow} = get_sieve(),
             _ = supervisor:start_child(lager_handler_watcher_sup,
-                                       [lager_event, lager_backend_throttle, [Threshold, ThresholdWindow]]),
+                                       [lager_event, lager_backend_throttle, [Threshold, ThresholdWindow,
+                                                                              SieveThreshold, SieveWindow]]),
             ok;
         {ok, BadThreshold} ->
             error_logger:error_msg("Invalid value for 'async_threshold': ~p~n", [BadThreshold]),
@@ -119,6 +121,10 @@ start(_StartType, _StartArgs) ->
 
     {ok, Pid, SavedHandlers}.
 
+get_sieve() ->
+    Threshold = application:get_env(lager, sieve_threshold, 1073741824),
+    Window = application:get_env(lager, sieve_window, 1073741824),
+    {Threshold, Window}.
 
 stop(Handlers) ->
     lists:foreach(fun(Handler) ->

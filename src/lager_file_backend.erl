@@ -69,7 +69,8 @@
         check_interval = ?DEFAULT_CHECK_INTERVAL,
         sync_interval = ?DEFAULT_SYNC_INTERVAL,
         sync_size = ?DEFAULT_SYNC_SIZE,
-        last_check = os:timestamp()
+        last_check = os:timestamp(),
+        sieved = 0
     }).
 
 -type option() :: {file, string()} | {level, lager:log_level()} |
@@ -137,15 +138,36 @@ handle_event({log, {lager_msg, _Dest, _Metadata, utrace, _DateTime, _Timestamp, 
     %% utrace messages shouldn't be logged to a file
     {ok, State};
 handle_event({log, Message},
-    #state{name=Name, level=L,formatter=Formatter,formatter_config=FormatConfig} = State) ->
+    #state{name=Name, level=L,formatter=Formatter,formatter_config=FormatConfig} = State_) ->
     case lager_util:is_loggable(Message,L,{lager_file_backend, Name}) of
         true ->
-            {ok,write(State, lager_msg:timestamp(Message), lager_msg:severity_as_int(Message), Formatter:format(Message,FormatConfig)) };
+            case lager_util:sieve(Message) of
+                true ->
+                    State = State_#state{sieved=State_#state.sieved+1},
+                    if
+                        (State#state.sieved rem 10000) == 0 ->
+                            {ok, log_sieved(Message, State)};
+                        true ->
+                            {ok, State}
+                    end;
+                false ->
+                    State__ = log_sieved(Message, State_),
+                    State = State__#state{sieved=0},
+                    {ok,write(State, lager_msg:timestamp(Message), lager_msg:severity_as_int(Message), Formatter:format(Message,FormatConfig)) }
+            end;
         false ->
-            {ok, State}
+            {ok, State_}
     end;
 handle_event(_Event, State) ->
     {ok, State}.
+
+log_sieved(Message, State=#state{sieved=Sieved}) when Sieved > 100 ->
+    write(State,
+        lager_msg:timestamp(Message),
+        lager_msg:severity_as_int(Message),
+        list_to_binary("WARNING! sieve is active -- "++integer_to_list(Sieved)++" sequential logs thrown out on the lager_file_backend. (Note: frontend counts aren't available)\n"));
+log_sieved(_Message, State) ->
+    State.
 
 %% @private
 handle_info({rotate, File}, #state{name=File,count=Count,date=Date} = State) ->

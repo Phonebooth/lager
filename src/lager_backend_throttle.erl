@@ -32,13 +32,17 @@
 -record(state, {
         hwm,
         window_min,
-        async = true
+        sieve_threshold,
+        sieve_window,
+        async = true,
+        sieve = false
     }).
 
-init([Hwm, Window]) ->
+init([Hwm, Window, SieveThreshold, SieveWindow]) ->
     lager_config:set(async, true),
-    {ok, #state{hwm=Hwm, window_min=Hwm - Window}}.
-
+    lager_config:set(sieve, false),
+    {ok, #state{hwm=Hwm, window_min=Hwm - Window,
+                sieve_threshold=SieveThreshold, sieve_window=SieveWindow}}.
 
 handle_call(get_loglevel, State) ->
     {ok, {mask, ?LOG_NONE}, State};
@@ -47,8 +51,23 @@ handle_call({set_loglevel, _Level}, State) ->
 handle_call(_Request, State) ->
     {ok, ok, State}.
 
-handle_event({log, _Message},State) ->
+handle_event({log, _Message},State_) ->
     {message_queue_len, Len} = erlang:process_info(self(), message_queue_len),
+
+    State = case {Len > State_#state.sieve_threshold, Len < State_#state.sieve_window, State_#state.sieve} of
+        {true, _, false} ->
+            %% need to flip to sieve mode
+            lager_config:set(sieve, true),
+            State_#state{sieve=true};
+        {_, true, true} ->
+            %% need to flip to sieve mode off
+            lager_config:set(sieve, false),
+            State_#state{sieve=false};
+        _ ->
+            %% nothing needs to change
+            State_
+    end,
+
     case {Len > State#state.hwm, Len < State#state.window_min, State#state.async} of
         {true, _, true} ->
             %% need to flip to sync mode

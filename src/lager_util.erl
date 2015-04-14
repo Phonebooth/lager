@@ -22,7 +22,7 @@
         open_logfile/2, ensure_logfile/4, rotate_logfile/2, format_time/0, format_time/1,
         localtime_ms/0, localtime_ms/1, maybe_utc/1, parse_rotation_date_spec/1,
         calculate_next_rotation/1, validate_trace/1, check_traces/4, is_loggable/3,
-        trace_filter/1, trace_filter/2]).
+        trace_filter/1, trace_filter/2, sieve/1]).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -176,6 +176,16 @@ ensure_logfile(Name, FD, Inode, Buffer) ->
                 Error ->
                     Error
             end
+    end.
+
+sieve(Message) ->
+    case lager_config:get(sieve, false) of
+        true ->
+            SeverityInt = lager_msg:severity_as_int(Message),
+            InfoSeverityInt = level_to_num(info),
+            InfoSeverityInt =< SeverityInt;
+        false ->
+            false
     end.
 
 %% returns localtime with milliseconds included
