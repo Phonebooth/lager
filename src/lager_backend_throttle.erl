@@ -44,8 +44,14 @@ init([Hwm, Window, SieveThreshold, SieveWindow]) ->
     {ok, #state{hwm=Hwm, window_min=Hwm - Window,
                 sieve_threshold=SieveThreshold, sieve_window=SieveWindow}}.
 
+handle_call({set_sieve, {Threshold, Window}}, State) ->
+    {ok, ok, State#state{sieve_threshold=Threshold, sieve_window=Window}};
+handle_call({set_sieve_threshold, Threshold}, State) ->
+    {ok, ok, State#state{sieve_threshold=Threshold}};
+handle_call({set_sieve_window, Window}, State) ->
+    {ok, ok, State#state{sieve_window=Window}};
 handle_call(get_loglevel, State) ->
-    {ok, {mask, ?LOG_NONE}, State};
+    {ok, undefined, State};
 handle_call({set_loglevel, _Level}, State) ->
     {ok, ok, State};
 handle_call(_Request, State) ->

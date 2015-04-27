@@ -33,6 +33,8 @@
         safe_format/3, safe_format_chop/3, dispatch_log/5, dispatch_log/9, 
         do_log/9, pr/2]).
 
+-export([set_sieve/2, set_sieve_threshold/1, set_sieve_window/1]).
+
 -type log_level() :: debug | info | notice | warning | error | critical | alert | emergency.
 -type log_level_number() :: 0..7.
 
@@ -288,6 +290,15 @@ set_loglevel(Handler, Ident, Level) when is_atom(Level) ->
     Reply = gen_event:call(lager_event, {Handler, Ident}, {set_loglevel, Level}, infinity),
     update_loglevel_config(),
     Reply.
+
+set_sieve(Threshold, Window) when is_integer(Threshold) andalso is_integer(Window) ->
+    gen_event:call(lager_event, lager_backend_throttle, {set_sieve, {Threshold, Window}}, infinity).
+
+set_sieve_threshold(Threshold) when is_integer(Threshold) ->
+    gen_event:call(lager_event, lager_backend_throttle, {set_sieve_threshold, Threshold}, infinity).
+
+set_sieve_window(Window) when is_integer(Window) ->
+    gen_event:call(lager_event, lager_backend_throttle, {set_sieve_window, Window}, infinity).
 
 %% @doc Get the loglevel for a particular backend. In the case that the backend
 %% has multiple identifiers, the lowest is returned
