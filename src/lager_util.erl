@@ -19,7 +19,7 @@
 -include_lib("kernel/include/file.hrl").
 
 -export([levels/0, level_to_num/1, num_to_level/1, config_to_mask/1, config_to_levels/1, mask_to_levels/1,
-        open_logfile/2, ensure_logfile/4, rotate_logfile/2, format_time/0, format_time/1,
+        open_logfile/2, ensure_logfile/4, rotate_logfile/2, rotate_logfile/3, format_time/0, format_time/1,
         localtime_ms/0, localtime_ms/1, maybe_utc/1, parse_rotation_date_spec/1,
         calculate_next_rotation/1, validate_trace/1, check_traces/4, is_loggable/3,
         trace_filter/1, trace_filter/2, sieve/1]).
@@ -207,17 +207,28 @@ maybe_utc({Date, {H, M, S, Ms}}) ->
             {Date1, {H1, M1, S1, Ms}}
     end.
 
+rotate_logfile(File, Count) ->
+    rotate_logfile(File, Count, false).
+
 %% renames and deletes failing are OK
-rotate_logfile(File, 0) ->
+rotate_logfile(File, 0, _) ->
     _ = file:delete(File),
     ok;
-rotate_logfile(File, 1) ->
+rotate_logfile(File, 1, Save) ->
+    case Save of
+        true ->
+            {A, B, C} = os:timestamp(),
+            Copy = File ++ "." ++ integer_to_list(A) ++ integer_to_list(B) ++ integer_to_list(C) ++ ".done",
+            file:copy(File, Copy);
+        _ ->
+            ok
+    end,
     _ = file:rename(File, File++".0"),
     rotate_logfile(File, 0);
-rotate_logfile(File, Count) ->
+rotate_logfile(File, Count, Save) ->
     _ =file:rename(File ++ "." ++ integer_to_list(Count - 2), File ++ "." ++
         integer_to_list(Count - 1)),
-    rotate_logfile(File, Count - 1).
+    rotate_logfile(File, Count - 1, Save).
 
 format_time() ->
     format_time(maybe_utc(localtime_ms())).

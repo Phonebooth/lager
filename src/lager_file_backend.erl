@@ -70,7 +70,8 @@
         sync_interval = ?DEFAULT_SYNC_INTERVAL,
         sync_size = ?DEFAULT_SYNC_SIZE,
         last_check = os:timestamp(),
-        sieved = 0
+        sieved = 0,
+        save = false
     }).
 
 -type option() :: {file, string()} | {level, lager:log_level()} |
@@ -103,12 +104,12 @@ init(LogFileConfig) when is_list(LogFileConfig) ->
             {error, {fatal, bad_config}};
         Config ->
             %% probabably a better way to do this, but whatever
-            [Name, Level, Date, Size, Count, SyncInterval, SyncSize, SyncOn, CheckInterval, Formatter, FormatterConfig] =
-              [proplists:get_value(Key, Config) || Key <- [file, level, date, size, count, sync_interval, sync_size, sync_on, check_interval, formatter, formatter_config]],
+            [Name, Level, Date, Size, Count, SyncInterval, SyncSize, SyncOn, CheckInterval, Formatter, FormatterConfig, Save] =
+              [proplists:get_value(Key, Config) || Key <- [file, level, date, size, count, sync_interval, sync_size, sync_on, check_interval, formatter, formatter_config, save]],
             schedule_rotation(Name, Date),
             State0 = #state{name=Name, level=Level, size=Size, date=Date, count=Count, formatter=Formatter,
                 formatter_config=FormatterConfig, sync_on=SyncOn, sync_interval=SyncInterval, sync_size=SyncSize,
-                check_interval=CheckInterval},
+                check_interval=CheckInterval, save=Save},
             State = case lager_util:open_logfile(Name, {SyncSize, SyncInterval}) of
                 {ok, {FD, Inode, _}} ->
                     State0#state{fd=FD, inode=Inode};
@@ -170,8 +171,8 @@ log_sieved(_Message, State) ->
     State.
 
 %% @private
-handle_info({rotate, File}, #state{name=File,count=Count,date=Date} = State) ->
-    lager_util:rotate_logfile(File, Count),
+handle_info({rotate, File}, #state{name=File,count=Count,date=Date,save=Save} = State) ->
+    lager_util:rotate_logfile(File, Count, Save),
     schedule_rotation(File, Date),
     {ok, State};
 handle_info(_Info, State) ->
@@ -207,14 +208,14 @@ config_to_id(Config) ->
 
 
 write(#state{name=Name, fd=FD, inode=Inode, flap=Flap, size=RotSize,
-        count=Count} = State, Timestamp, Level, Msg) ->
+        count=Count, save=Save} = State, Timestamp, Level, Msg) ->
     LastCheck = timer:now_diff(Timestamp, State#state.last_check) div 1000,
     case LastCheck >= State#state.check_interval orelse FD == undefined of
         true ->
             %% need to check for rotation
             case lager_util:ensure_logfile(Name, FD, Inode, {State#state.sync_size, State#state.sync_interval}) of
                 {ok, {_, _, Size}} when RotSize /= 0, Size > RotSize ->
-                    lager_util:rotate_logfile(Name, Count),
+                    lager_util:rotate_logfile(Name, Count, Save),
                     %% go around the loop again, we'll do another rotation check and hit the next clause here
                     write(State, Timestamp, Level, Msg);
                 {ok, {NewFD, NewInode, _}} ->
@@ -368,6 +369,13 @@ validate_logfile_proplist([{formatter_config, FmtCfg}|Tail], Acc) ->
             validate_logfile_proplist(Tail, [{formatter_config, FmtCfg}|Acc]);
         false ->
             throw({bad_config, "Invalid formatter config", FmtCfg})
+    end;
+validate_logfile_proplist([{save, Save}|Tail], Acc) ->
+    case is_boolean(Save) of
+        true ->
+            validate_logfile_proplist(Tail, [{save, Save}|Acc]);
+        _ ->
+            throw({bad_config, "Invalid formatter config", Save})
     end;
 validate_logfile_proplist([Other|_Tail], _Acc) ->
     throw({bad_config, "Invalid option", Other}).
