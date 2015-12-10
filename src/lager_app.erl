@@ -122,8 +122,14 @@ start(_StartType, _StartArgs) ->
     {ok, Pid, SavedHandlers}.
 
 get_sieve() ->
-    Threshold = application:get_env(lager, sieve_threshold, 1073741824),
-    Window = application:get_env(lager, sieve_window, 1073741824),
+    Threshold = case application:get_env(lager, sieve_threshold) of
+                    {ok, T} -> T;
+                    _ -> 1073741824
+                end, 
+    Window = case application:get_env(lager, sieve_window) of
+                {ok, W} -> W;
+                _ -> 1073741824
+             end,
     {Threshold, Window}.
 
 stop(Handlers) ->
