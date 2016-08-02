@@ -131,7 +131,12 @@ discard_messages(Second, Count) ->
     case Second of
         {M, S, _} ->
             receive
-                _Msg ->
+                %% we only discard gen_event notifications, because
+                %% otherwise we might discard gen_event internal
+                %% messages, such as trapped EXITs
+                {notify, _Event} ->
+                    discard_messages(Second, Count+1);
+                {_From, _Tag, {sync_notify, _Event}} ->
                     discard_messages(Second, Count+1)
             after 0 ->
                     Count
@@ -192,7 +197,7 @@ log_event(Event, State) ->
                     ?LOGFMT(error, Pid, "Webmachine error at path ~p : ~s", [Path, format_reason(StackTrace)]);
                 _ ->
                     ?CRASH_LOG(Event),
-                    ?LOGMSG(error, Pid, lager:safe_format(Fmt, Args, ?DEFAULT_TRUNCATION))
+                    ?LOGFMT(error, Pid, Fmt, Args)
             end;
         {error_report, _GL, {Pid, std_error, D}} ->
             ?CRASH_LOG(Event),
@@ -212,17 +217,22 @@ log_event(Event, State) ->
             ?CRASH_LOG(Event),
             ?LOGMSG(error, Pid, "CRASH REPORT " ++ format_crash_report(Self, Neighbours));
         {warning_msg, _GL, {Pid, Fmt, Args}} ->
-            ?LOGMSG(warning, Pid, lager:safe_format(Fmt, Args, ?DEFAULT_TRUNCATION));
+            ?LOGFMT(warning, Pid, Fmt, Args);
         {warning_report, _GL, {Pid, std_warning, Report}} ->
             ?LOGMSG(warning, Pid, print_silly_list(Report));
         {info_msg, _GL, {Pid, Fmt, Args}} ->
-            ?LOGMSG(info, Pid, lager:safe_format(Fmt, Args, ?DEFAULT_TRUNCATION));
+            ?LOGFMT(info, Pid, Fmt, Args);
         {info_report, _GL, {Pid, std_info, D}} when is_list(D) ->
             Details = lists:sort(D),
             case Details of
                 [{application, App}, {exited, Reason}, {type, _Type}] ->
-                    ?LOGFMT(info, Pid, "Application ~w exited with reason: ~s",
-                        [App, format_reason(Reason)]);
+                    case application:get_env(lager, suppress_application_start_stop) of
+                        {ok, true} when Reason == stopped ->
+                            ok;
+                        _ ->
+                            ?LOGFMT(info, Pid, "Application ~w exited with reason: ~s",
+                                    [App, format_reason(Reason)])
+                    end;
                 _ ->
                     ?LOGMSG(info, Pid, print_silly_list(D))
             end;
@@ -232,11 +242,16 @@ log_event(Event, State) ->
             Details = lists:sort(D),
             case Details of
                 [{application, App}, {started_at, Node}] ->
-                    ?LOGFMT(info, P, "Application ~w started on node ~w",
-                        [App, Node]);
+                    case application:get_env(lager, suppress_application_start_stop) of
+                        {ok, true} ->
+                            ok;
+                        _ ->
+                            ?LOGFMT(info, P, "Application ~w started on node ~w",
+                                    [App, Node])
+                    end;
                 [{started, Started}, {supervisor, Name}] ->
-                    MFA = format_mfa(proplists:get_value(mfargs, Started)),
-                    Pid = proplists:get_value(pid, Started),
+                    MFA = format_mfa(get_value(mfargs, Started)),
+                    Pid = get_value(pid, Started),
                     ?LOGFMT(debug, P, "Supervisor ~w started ~s at pid ~w",
                         [supervisor_name(Name), MFA, Pid]);
                 _ ->
@@ -248,13 +263,13 @@ log_event(Event, State) ->
     {ok, State}.
 
 format_crash_report(Report, Neighbours) ->
-    Name = case proplists:get_value(registered_name, Report, []) of
+    Name = case get_value(registered_name, Report, []) of
         [] ->
             %% process_info(Pid, registered_name) returns [] for unregistered processes
-            proplists:get_value(pid, Report);
+            get_value(pid, Report);
         Atom -> Atom
     end,
-    {Class, Reason, Trace} = proplists:get_value(error_info, Report),
+    {Class, Reason, Trace} = get_value(error_info, Report),
     ReasonStr = format_reason({Reason, Trace}),
     Type = case Class of
         exit -> "exited";
@@ -264,17 +279,25 @@ format_crash_report(Report, Neighbours) ->
         [Name, length(Neighbours), Type, ReasonStr]).
 
 format_offender(Off) ->
-    case proplists:get_value(mfargs, Off) of
+    case get_value(mfargs, Off) of
         undefined ->
             %% supervisor_bridge
             io_lib:format("at module ~w at ~w",
-                [proplists:get_value(mod, Off), proplists:get_value(pid, Off)]);
+                [get_value(mod, Off), get_value(pid, Off)]);
         MFArgs ->
             %% regular supervisor
             MFA = format_mfa(MFArgs),
-            Name = proplists:get_value(name, Off),
+
+            %% In 2014 the error report changed from `name' to
+            %% `id', so try that first.
+            Name = case get_value(id, Off) of
+                       undefined ->
+                           get_value(name, Off);
+                       Id ->
+                           Id
+                   end,
             io_lib:format("~p started with ~s at ~w",
-                [Name, MFA, proplists:get_value(pid, Off)])
+                [Name, MFA, get_value(pid, Off)])
     end.
 
 format_reason({'function not exported', [{M, F, A},MFA|_]}) ->
@@ -338,6 +361,8 @@ format_reason({badarg, [MFA,MFA2|_]}) ->
             %% seems to be generated by a bad call to a BIF
             ["bad argument in ", format_mfa(MFA)]
     end;
+format_reason({{badarg, Stack}, _}) ->
+    format_reason({badarg, Stack});
 format_reason({{badarity, {Fun, Args}}, [MFA|_]}) ->
     {arity, Arity} = lists:keyfind(arity, 1, erlang:fun_info(Fun)),
     [io_lib:format("fun called with wrong arity of ~w instead of ~w in ",
@@ -361,7 +386,7 @@ format_mfa({M, F, A}) when is_list(A) ->
 format_mfa({M, F, A}) when is_integer(A) ->
     io_lib:format("~w:~w/~w", [M, F, A]);
 format_mfa({M, F, A, Props}) when is_list(Props) ->
-    case proplists:get_value(line, Props) of
+    case get_value(line, Props) of
         undefined ->
             format_mfa({M, F, A});
         Line ->
@@ -405,23 +430,17 @@ print_val(Val) ->
     {Str, _} = lager_trunc_io:print(Val, 500),
     Str.
 
+
+%% @doc Faster than proplists, but with the same API as long as you don't need to
+%% handle bare atom keys
+get_value(Key, Value) ->
+    get_value(Key, Value, undefined).
+
+get_value(Key, List, Default) ->
+    case lists:keyfind(Key, 1, List) of
+        false -> Default;
+        {Key, Value} -> Value
+    end.
+
 supervisor_name({local, Name}) -> Name;
 supervisor_name(Name) -> Name.
--ifdef(TEST).
-
-%% Not intended to be a fully paranoid EUnit test....
-
-t0() ->
-    application:stop(lager),
-    application:stop(sasl),
-    application:start(sasl),
-    application:start(lager),
-    set_high_water(5),
-    [error_logger:warning_msg("Foo ~p!", [X]) || X <- lists:seq(1,10)],
-    timer:sleep(1000),
-    [error_logger:warning_msg("Bar ~p!", [X]) || X <- lists:seq(1,10)],
-    timer:sleep(1000),
-    error_logger:warning_msg("Baz!"),
-    ok.
-
--endif. % TEST

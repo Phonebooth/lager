@@ -26,8 +26,8 @@
 -export([start/0,
         log/3, log/4,
         md/0, md/1,
-        trace/2, trace/3, trace_file/2, trace_file/3, trace_console/1, trace_console/2,
-        clear_all_traces/0, stop_trace/1, status/0, 
+        trace/2, trace/3, trace_file/2, trace_file/3, trace_file/4, trace_console/1, trace_console/2,
+        clear_all_traces/0, stop_trace/1, stop_trace/3, status/0,
         get_loglevel/1, set_loglevel/2, set_loglevel/3, get_loglevels/0,
         update_loglevel_config/0, posix_error/1,
         safe_format/3, safe_format_chop/3, dispatch_log/5, dispatch_log/9, 
@@ -148,33 +148,40 @@ log(Level, Metadata, Format, Args) when is_list(Metadata) ->
     dispatch_log(Level, Metadata, Format, Args, ?DEFAULT_TRUNCATION).
 
 trace_file(File, Filter) ->
-    trace_file(File, Filter, debug).
+    trace_file(File, Filter, debug, []).
 
-trace_file(File, Filter, Level) ->
-    Trace0 = {Filter, Level, {lager_file_backend, File}},
+trace_file(File, Filter, Level) when is_atom(Level) ->
+    trace_file(File, Filter, Level, []);
+
+trace_file(File, Filter, Options) when is_list(Options) ->
+    trace_file(File, Filter, debug, Options).
+
+trace_file(File, Filter, Level, Options) ->
+    FileName = lager_util:expand_path(File),
+    Trace0 = {Filter, Level, {lager_file_backend, FileName}},
     case lager_util:validate_trace(Trace0) of
         {ok, Trace} ->
             Handlers = gen_event:which_handlers(lager_event),
             %% check if this file backend is already installed
-            Res = case lists:member({lager_file_backend, File}, Handlers) of
-                false ->
-                    %% install the handler
+            Res = case lists:member({lager_file_backend, FileName}, Handlers) of
+               false ->
+                     %% install the handler
+                    LogFileConfig = lists:keystore(level, 1, lists:keystore(file, 1, Options, {file, FileName}), {level, none}),
                     supervisor:start_child(lager_handler_watcher_sup,
-                        [lager_event, {lager_file_backend, File}, {File, none}]);
+                        [lager_event, {lager_file_backend, FileName}, LogFileConfig]);
                 _ ->
                     {ok, exists}
             end,
             case Res of
               {ok, _} ->
                 add_trace_to_loglevel_config(Trace),
-                {ok, Trace};
+                {ok, {{lager_file_backend, FileName}, Filter, Level}};
               {error, _} = E ->
                 E
             end;
         Error ->
             Error
     end.
-
 
 trace_console(Filter) ->
     trace_console(Filter, debug).
@@ -185,28 +192,52 @@ trace_console(Filter, Level) ->
 trace(Backend, Filter) ->
     trace(Backend, Filter, debug).
 
+trace({lager_file_backend, File}, Filter, Level) ->
+    trace_file(File, Filter, Level);
+
 trace(Backend, Filter, Level) ->
     Trace0 = {Filter, Level, Backend},
     case lager_util:validate_trace(Trace0) of
         {ok, Trace} ->
             add_trace_to_loglevel_config(Trace),
-            {ok, Trace};
+            {ok, {Backend, Filter, Level}};
         Error ->
             Error
     end.
 
-stop_trace({_Filter, _Level, Target} = Trace) ->
+stop_trace(Backend, Filter, Level) ->
+    Trace0 = {Filter, Level, Backend},
+    case lager_util:validate_trace(Trace0) of
+        {ok, Trace} ->
+            stop_trace_int(Trace);
+        Error ->
+            Error
+    end.
+
+stop_trace({Backend, Filter, Level}) ->
+    stop_trace(Backend, Filter, Level).
+
+%% Important: validate_trace_filters orders the arguments of
+%% trace tuples differently than the way outside callers have
+%% the trace tuple.
+%%
+%% That is to say, outside they are represented as 
+%% `{Backend, Filter, Level}'
+%%
+%% and when they come back from validation, they're
+%% `{Filter, Level, Backend}'
+stop_trace_int({_Filter, _Level, Backend} = Trace) ->
     {Level, Traces} = lager_config:get(loglevel),
     NewTraces =  lists:delete(Trace, Traces),
-    lager_util:trace_filter([ element(1, T) || T <- NewTraces ]),
+    _ = lager_util:trace_filter([ element(1, T) || T <- NewTraces ]),
     %MinLevel = minimum_loglevel(get_loglevels() ++ get_trace_levels(NewTraces)),
     lager_config:set(loglevel, {Level, NewTraces}),
-    case get_loglevel(Target) of
+    case get_loglevel(Backend) of
         none ->
             %% check no other traces point here
-            case lists:keyfind(Target, 3, NewTraces) of
+            case lists:keyfind(Backend, 3, NewTraces) of
                 false ->
-                    gen_event:delete_handler(lager_event, Target, []);
+                    gen_event:delete_handler(lager_event, Backend, []);
                 _ ->
                     ok
             end;
@@ -217,7 +248,7 @@ stop_trace({_Filter, _Level, Target} = Trace) ->
 
 clear_all_traces() ->
     {Level, _Traces} = lager_config:get(loglevel),
-    lager_util:trace_filter(none),
+    _ = lager_util:trace_filter(none),
     lager_config:set(loglevel, {Level, []}),
     lists:foreach(fun(Handler) ->
           case get_loglevel(Handler) of
@@ -335,7 +366,7 @@ add_trace_to_loglevel_config(Trace) ->
     case lists:member(Trace, Traces) of
         false ->
             NewTraces = [Trace|Traces],
-            lager_util:trace_filter([ element(1, T) || T <- NewTraces]),
+            _ = lager_util:trace_filter([ element(1, T) || T <- NewTraces]),
             lager_config:set(loglevel, {MinLevel, [Trace|Traces]});
         _ ->
             ok
@@ -378,30 +409,47 @@ safe_format_chop(Fmt, Args, Limit) ->
 
 %% @doc Print a record lager found during parse transform
 pr(Record, Module) when is_tuple(Record), is_atom(element(1, Record)) ->
-    try Module:module_info(attributes) of
-        Attrs ->
-            case lists:keyfind(lager_records, 1, Attrs) of
-                false ->
-                    Record;
-                {lager_records, Records} ->
-                    RecordName = element(1, Record),
-                    RecordSize = tuple_size(Record) - 1,
-                    case lists:filter(fun({Name, Fields}) when Name == RecordName,
-                                length(Fields) == RecordSize ->
-                                    true;
-                                (_) ->
-                                    false
-                            end, Records) of
-                        [] ->
-                            Record;
-                        [{RecordName, RecordFields}|_] ->
-                            {'$lager_record', RecordName,
-                                lists:zip(RecordFields, tl(tuple_to_list(Record)))}
-                    end
-            end
+    try 
+        case is_record_known(Record, Module) of
+            false ->
+                Record;
+            {RecordName, RecordFields} ->
+                {'$lager_record', RecordName, 
+                    zip(RecordFields, tl(tuple_to_list(Record)), Module, [])}
+        end
     catch
         error:undef ->
             Record
     end;
 pr(Record, _) ->
     Record.
+
+zip([FieldName|RecordFields], [FieldValue|Record], Module, ToReturn) ->
+    case   is_tuple(FieldValue) andalso
+           tuple_size(FieldValue) > 0 andalso
+           is_atom(element(1, FieldValue)) andalso
+           is_record_known(FieldValue, Module) of
+        false ->
+            zip(RecordFields, Record, Module, [{FieldName, FieldValue}|ToReturn]);
+        _Else ->
+            F = {FieldName, pr(FieldValue, Module)},
+            zip(RecordFields, Record, Module, [F|ToReturn])
+    end;
+zip([], [], _Module, ToReturn) ->
+    lists:reverse(ToReturn).
+
+is_record_known(Record, Module) -> 
+    Name = element(1, Record),
+    Attrs = Module:module_info(attributes),
+    case lists:keyfind(lager_records, 1, Attrs) of
+        false -> false;
+        {lager_records, Records} -> 
+            case lists:keyfind(Name, 1, Records) of
+                false -> false;
+                {Name, RecordFields} -> 
+                    case (tuple_size(Record) - 1) =:= length(RecordFields) of
+                        false -> false;
+                        true -> {Name, RecordFields}
+                    end
+            end
+    end.

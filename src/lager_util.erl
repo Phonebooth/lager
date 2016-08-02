@@ -22,7 +22,7 @@
         open_logfile/2, ensure_logfile/4, rotate_logfile/2, format_time/0, format_time/1,
         localtime_ms/0, localtime_ms/1, maybe_utc/1, parse_rotation_date_spec/1,
         calculate_next_rotation/1, validate_trace/1, check_traces/4, is_loggable/3,
-        trace_filter/1, trace_filter/2, sieve/1]).
+        trace_filter/1, trace_filter/2, sieve/1, expand_path/1]).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -207,16 +207,18 @@ maybe_utc({Date, {H, M, S, Ms}}) ->
             {Date1, {H1, M1, S1, Ms}}
     end.
 
-%% renames and deletes failing are OK
+%% renames failing are OK
 rotate_logfile(File, 0) ->
-    _ = file:delete(File),
-    ok;
+    file:delete(File);
 rotate_logfile(File, 1) ->
-    _ = file:rename(File, File++".0"),
-    rotate_logfile(File, 0);
+    case file:rename(File, File++".0") of
+        ok ->
+            ok;
+        _ ->
+            rotate_logfile(File, 0)
+    end;
 rotate_logfile(File, Count) ->
-    _ =file:rename(File ++ "." ++ integer_to_list(Count - 2), File ++ "." ++
-        integer_to_list(Count - 1)),
+    _ = file:rename(File ++ "." ++ integer_to_list(Count - 2), File ++ "." ++ integer_to_list(Count - 1)),
     rotate_logfile(File, Count - 1).
 
 format_time() ->
@@ -363,17 +365,16 @@ calculate_next_rotation([{date, Date}|T], {{Year, Month, Day}, _} = Now) ->
     NewNow = calendar:gregorian_seconds_to_datetime(Seconds),
     calculate_next_rotation(T, NewNow).
 
-
+-spec trace_filter(Query :: 'none' | [tuple()]) -> {ok, any()}.
 trace_filter(Query) ->
     trace_filter(?DEFAULT_TRACER, Query).
 
 %% TODO: Support multiple trace modules 
+%-spec trace_filter(Module :: atom(), Query :: 'none' | [tuple()]) -> {ok, any()}.
 trace_filter(Module, Query) when Query == none; Query == [] ->
-    trace_filter(Module, glc:null(false));
+    {ok, _} = glc:compile(Module, glc:null(false));
 trace_filter(Module, Query) when is_list(Query) ->
-    trace_filter(Module, glc_lib:reduce(trace_any(Query)));
-trace_filter(Module, Query) ->
-    {ok, _} = glc:compile(Module, Query).
+    {ok, _} = glc:compile(Module, glc_lib:reduce(trace_any(Query))).
 
 validate_trace({Filter, Level, {Destination, ID}}) when is_tuple(Filter); is_list(Filter), is_atom(Level), is_atom(Destination) ->
     case validate_trace({Filter, Level, Destination}) of
@@ -402,6 +403,7 @@ validate_trace_filter(Filter) when is_tuple(Filter), is_atom(element(1, Filter))
     false;
 validate_trace_filter(Filter) ->
         case lists:all(fun({Key, '*'}) when is_atom(Key) -> true; 
+                          ({Key, '!'}) when is_atom(Key) -> true;
                           ({Key, _Value})      when is_atom(Key) -> true;
                           ({Key, '=', _Value}) when is_atom(Key) -> true;
                           ({Key, '<', _Value}) when is_atom(Key) -> true;
@@ -426,6 +428,8 @@ trace_acc([], Acc) ->
 	lists:reverse(Acc);
 trace_acc([{Key, '*'}|T], Acc) ->
 	trace_acc(T, [glc:wc(Key)|Acc]);
+trace_acc([{Key, '!'}|T], Acc) ->
+	trace_acc(T, [glc:nf(Key)|Acc]);
 trace_acc([{Key, Val}|T], Acc) ->
 	trace_acc(T, [glc:eq(Key, Val)|Acc]);
 trace_acc([{Key, '=', Val}|T], Acc) ->
@@ -474,6 +478,15 @@ i2l(I) when I < 10  -> [$0, $0+I];
 i2l(I)              -> integer_to_list(I).
 i3l(I) when I < 100 -> [$0 | i2l(I)];
 i3l(I)              -> integer_to_list(I).
+
+%% When log_root option is provided, get the real path to a file
+expand_path(RelPath) ->
+    case application:get_env(lager, log_root) of
+        {ok, LogRoot} when is_list(LogRoot) -> % Join relative path
+            filename:join(LogRoot, RelPath);
+        undefined -> % No log_root given, keep relative path
+            RelPath
+    end.
 
 -ifdef(TEST).
 
@@ -575,7 +588,27 @@ rotate_file_test() ->
                 rotate_logfile("rotation.log", 10)
     end || N <- lists:seq(0, 20)].
 
+rotate_file_fail_test() ->
+    %% make sure the directory exists
+    ?assertEqual(ok, filelib:ensure_dir("rotation/rotation.log")),
+    %% fix the permissions on it
+    os:cmd("chown -R u+rwx rotation"),
+    %% delete any old files
+    [ok = file:delete(F) || F <- filelib:wildcard("rotation/*")],
+    %% write a file
+    file:write_file("rotation/rotation.log", "hello"),
+    %% hose up the permissions
+    os:cmd("chown u-w rotation"),
+    ?assertMatch({error, _}, rotate_logfile("rotation.log", 10)),
+    ?assert(filelib:is_regular("rotation/rotation.log")),
+    os:cmd("chown u+w rotation"),
+    ?assertMatch(ok, rotate_logfile("rotation/rotation.log", 10)),
+    ?assert(filelib:is_regular("rotation/rotation.log.0")),
+    ?assertEqual(false, filelib:is_regular("rotation/rotation.log")),
+    ok.
+
 check_trace_test() ->
+    lager:start(),
     trace_filter(none),
     %% match by module
     ?assertEqual([foo], check_traces([{module, ?MODULE}], ?EMERGENCY, [
@@ -616,7 +649,8 @@ check_trace_test() ->
                 {[{module, '*'}], config_to_mask('!=info'), anythingbutinfo},
                 {[{module, '*'}], config_to_mask('!=notice'), anythingbutnotice}
                 ], [])),
-
+    application:stop(lager),
+    application:stop(goldrush),
     ok.
 
 is_loggable_test_() ->
@@ -692,6 +726,23 @@ mask_to_levels_test() ->
     ?assertEqual([debug, info], mask_to_levels(2#11000000)),
     ?assertEqual([debug, info, emergency], mask_to_levels(2#11000001)),
     ?assertEqual([debug, notice, error], mask_to_levels(?DEBUG bor ?NOTICE bor ?ERROR)),
+    ok.
+
+expand_path_test() ->
+    OldRootVal = application:get_env(lager, log_root),
+
+    ok = application:unset_env(lager, log_root),
+    ?assertEqual("/foo/bar", expand_path("/foo/bar")),
+    ?assertEqual("foo/bar", expand_path("foo/bar")),
+
+    ok = application:set_env(lager, log_root, "log/dir"),
+    ?assertEqual("/foo/bar", expand_path("/foo/bar")), % Absolute path should not be changed
+    ?assertEqual("log/dir/foo/bar", expand_path("foo/bar")),
+
+    case OldRootVal of
+        undefined -> application:unset_env(lager, log_root);
+        {ok, Root} -> application:set_env(lager, log_root, Root)
+    end,
     ok.
 
 -endif.

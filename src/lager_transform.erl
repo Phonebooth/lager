@@ -30,6 +30,8 @@
 %% @private
 parse_transform(AST, Options) ->
     TruncSize = proplists:get_value(lager_truncation_size, Options, ?DEFAULT_TRUNCATION),
+    Enable = proplists:get_value(lager_print_records_flag, Options, true),
+    put(print_records_flag, Enable),
     put(truncation_size, TruncSize),
     erlang:put(records, []),
     %% .app file should either be in the outdir, or the same dir as the source file
@@ -37,7 +39,12 @@ parse_transform(AST, Options) ->
     walk_ast([], AST).
 
 walk_ast(Acc, []) ->
-    insert_record_attribute(Acc);
+    case get(print_records_flag) of
+        true ->
+            insert_record_attribute(Acc);
+        false ->
+            lists:reverse(Acc)
+    end;
 walk_ast(Acc, [{attribute, _, module, {Module, _PmodArgs}}=H|T]) ->
     %% A wild parameterized module appears!
     put(module, Module),
@@ -50,15 +57,18 @@ walk_ast(Acc, [{function, Line, Name, Arity, Clauses}|T]) ->
     walk_ast([{function, Line, Name, Arity,
                 walk_clauses([], Clauses)}|Acc], T);
 walk_ast(Acc, [{attribute, _, record, {Name, Fields}}=H|T]) ->
-    FieldNames = lists:map(fun({record_field, _, {atom, _, FieldName}}) ->
-                FieldName;
-            ({record_field, _, {atom, _, FieldName}, _Default}) ->
-                FieldName
-        end, Fields),
+    FieldNames = lists:map(fun record_field_name/1, Fields),
     stash_record({Name, FieldNames}),
     walk_ast([H|Acc], T);
 walk_ast(Acc, [H|T]) ->
     walk_ast([H|Acc], T).
+
+record_field_name({record_field, _, {atom, _, FieldName}}) ->
+    FieldName;
+record_field_name({record_field, _, {atom, _, FieldName}, _Default}) ->
+    FieldName;
+record_field_name({typed_record_field, Field, _Type}) ->
+    record_field_name(Field).
 
 walk_clauses(Acc, []) ->
     lists:reverse(Acc);

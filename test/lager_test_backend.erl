@@ -1,4 +1,6 @@
-%% Copyright (c) 2011-2012 Basho Technologies, Inc.  All Rights Reserved.
+%% -------------------------------------------------------------------
+%%
+%% Copyright (c) 2011-2015 Basho Technologies, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -13,6 +15,8 @@
 %% KIND, either express or implied.  See the License for the
 %% specific language governing permissions and limitations
 %% under the License.
+%%
+%% -------------------------------------------------------------------
 
 -module(lager_test_backend).
 
@@ -23,8 +27,8 @@
 -export([init/1, handle_call/2, handle_event/2, handle_info/2, terminate/2,
         code_change/3]).
 
--record(state, {level, buffer, ignored}).
--record(test, {attrs, format, args}).
+-record(state, {level :: list(), buffer :: list(), ignored :: list()}).
+-record(test, {attrs :: term(), format :: term() , args :: term()}).
 -compile([{parse_transform, lager_transform}]).
 
 -ifdef(TEST).
@@ -108,9 +112,25 @@ print_bad_state() ->
 
 has_line_numbers() ->
     %% are we R15 or greater
-    Rel = erlang:system_info(otp_release),
-    {match, [Major]} = re:run(Rel, "^R(\\d+)[A|B](|0(\\d))$", [{capture, [1], list}]),
-    list_to_integer(Major) >= 15.
+    % this gets called a LOT - cache the answer
+    case erlang:get({?MODULE, has_line_numbers}) of
+        undefined ->
+            R = otp_version() >= 15,
+            erlang:put({?MODULE, has_line_numbers}, R),
+            R;
+        Bool ->
+            Bool
+    end.
+
+otp_version() ->
+    otp_version(erlang:system_info(otp_release)).
+
+otp_version([$R | Rel]) ->
+    {Ver, _} = string:to_integer(Rel),
+    Ver;
+otp_version(Rel) ->
+    {Ver, _} = string:to_integer(Rel),
+    Ver.
 
 not_running_test() ->
     ?assertEqual({error, lager_not_running}, lager:log(info, self(), "not running")).
@@ -388,10 +408,16 @@ lager_test_() ->
                         lager:info([{requestid, 8}], "hello world"),
                         lager:info([{requestid, 9}, {foo, bar}], "hello world"),
                         lager:info([{requestid, 10}], "hello world"),
-                        ?assertEqual(7, count()),
+                        lager:trace(?MODULE, [{fu, '!'}]),
+                        lager:info([{foo, bar}], "hello world"),
+                        lager:info([{ooh, car}], "hello world"),
+                        lager:info([{fu, bar}], "hello world"),
+                        lager:trace(?MODULE, [{fu, '*'}]),
+                        lager:info([{fu, bar}], "hello world"),
+                        ?assertEqual(10, count()),
                         lager:clear_all_traces(),
                         lager:info([{requestid, 6}], "hello world"),
-                        ?assertEqual(7, count()),
+                        ?assertEqual(10, count()),
                         ok
                 end
             },
@@ -441,7 +467,7 @@ lager_test_() ->
                         ?assertEqual(0, count()),
                         application:stop(lager),
                         application:set_env(lager, traces, [{lager_test_backend, [{foo, bar}], debug}]),
-                        application:start(lager),
+                        lager:start(),
                         lager:debug([{foo, bar}], "hello world"),
                         ?assertEqual(1, count()),
                         application:unset_env(lager, traces),
@@ -460,6 +486,24 @@ lager_test_() ->
                         lager:stop_trace(T),
                         ok = lager:notice("hello world"),
                         ?assertEqual(1, count()),
+                        ok
+                end
+            },
+            {"stopped trace stops and removes its event handler (gh#267)",
+                fun() ->
+                        StartHandlers = gen_event:which_handlers(lager_event),
+                        {_, T0} = lager_config:get(loglevel),
+                        ?assertEqual([], T0),
+                        {ok, Test} = lager:trace_file("/tmp/test", [{vhost, test}]),
+                        MidHandlers = gen_event:which_handlers(lager_event),
+                        ?assertEqual(length(StartHandlers)+1, length(MidHandlers)),
+                        {_, T1} = lager_config:get(loglevel),
+                        ?assertEqual(1, length(T1)),
+                        ok = lager:stop_trace(Test),
+                        {_, T2} = lager_config:get(loglevel),
+                        ?assertEqual([], T2),
+                        EndHandlers = gen_event:which_handlers(lager_event),
+                        ?assertEqual(StartHandlers, EndHandlers),
                         ok
                 end
             },
@@ -505,7 +549,7 @@ lager_test_() ->
             {"record printing fails gracefully when module is invalid",
                 fun() ->
                         spawn(fun() -> lager:info("State ~p", [lager:pr({state, 1}, not_a_module)]) end),
-                        timer:sleep(100),
+                        timer:sleep(1000),
                         {Level, _Time, Message, _Metadata}  = pop(),
                         ?assertMatch(Level, lager_util:level_to_num(info)),
                         ?assertEqual("State {state,1}", lists:flatten(Message)),
@@ -555,11 +599,12 @@ setup() ->
     application:load(lager),
     application:set_env(lager, handlers, [{?MODULE, info}]),
     application:set_env(lager, error_logger_redirect, false),
-    application:start(lager),
+    lager:start(),
     gen_event:call(lager_event, ?MODULE, flush).
 
 cleanup(_) ->
     application:stop(lager),
+    application:stop(goldrush),
     error_logger:tty(true).
 
 
@@ -572,20 +617,42 @@ crash(Type) ->
 test_body(Expected, Actual) ->
     case has_line_numbers() of
         true ->
-            FileLine = string:substr(Actual, length(Expected)+1),
-            Body = string:substr(Actual, 1, length(Expected)),
+            ExLen = length(Expected),
+            {Body, Rest} = case length(Actual) > ExLen of
+                true ->
+                    {string:substr(Actual, 1, ExLen),
+                        string:substr(Actual, (ExLen + 1))};
+                _ ->
+                    {Actual, []}
+            end,
             ?assertEqual(Expected, Body),
-            case string:substr(FileLine, 1, 6) of
+            % OTP-17 (and maybe later releases) may tack on additional info
+            % about the failure, so if Actual starts with Expected (already
+            % confirmed by having gotten past assertEqual above) and ends
+            % with " line NNN" we can ignore what's in-between. By extension,
+            % since there may not be line information appended at all, any
+            % text we DO find is reportable, but not a test failure.
+            case Rest of
                 [] ->
-                    %% sometimes there's no line information...
-                    ?assert(true);
-                " line " ->
-                    ?assert(true);
-                Other ->
-                    ?debugFmt("unexpected trailing data ~p", [Other]),
-                    ?assert(false)
+                    ok;
+                _ ->
+                    % isolate the extra data and report it if it's not just
+                    % a line number indicator
+                    case re:run(Rest, "^.*( line \\d+)$", [{capture, [1]}]) of
+                        nomatch ->
+                            ?debugFmt(
+                                "Trailing data \"~s\" following \"~s\"",
+                                [Rest, Expected]);
+                        {match, [{0, _}]} ->
+                            % the whole sting is " line NNN"
+                            ok;
+                        {match, [{Off, _}]} ->
+                            ?debugFmt(
+                                "Trailing data \"~s\" following \"~s\"",
+                                [string:substr(Rest, 1, Off), Expected])
+                    end
             end;
-        false ->
+        _ ->
             ?assertEqual(Expected, Actual)
     end.
 
@@ -600,7 +667,7 @@ error_logger_redirect_crash_test_() ->
                         ?assertEqual(Pid,proplists:get_value(pid,Metadata)),
                         ?assertEqual(lager_util:level_to_num(error),Level)
                 end
-            } 
+            }
     end,
     {foreach,
         fun() ->
@@ -608,12 +675,13 @@ error_logger_redirect_crash_test_() ->
                 application:load(lager),
                 application:set_env(lager, error_logger_redirect, true),
                 application:set_env(lager, handlers, [{?MODULE, error}]),
-                application:start(lager),
+                lager:start(),
                 crash:start()
         end,
 
         fun(_) ->
                 application:stop(lager),
+                application:stop(goldrush),
                 case whereis(crash) of
                     undefined -> ok;
                     Pid -> exit(Pid, kill)
@@ -655,7 +723,7 @@ error_logger_redirect_test_() ->
                 application:load(lager),
                 application:set_env(lager, error_logger_redirect, true),
                 application:set_env(lager, handlers, [{?MODULE, info}]),
-                application:start(lager),
+                lager:start(),
                 lager:log(error, self(), "flush flush"),
                 timer:sleep(100),
                 gen_event:call(lager_event, ?MODULE, flush)
@@ -663,6 +731,7 @@ error_logger_redirect_test_() ->
 
         fun(_) ->
                 application:stop(lager),
+                application:stop(goldrush),
                 error_logger:tty(true)
         end,
         [
@@ -700,6 +769,17 @@ error_logger_redirect_test_() ->
                         ?assertEqual(Expected, lists:flatten(Msg))
                 end
             },
+            {"error messages with unicode characters in Args are printed",
+                fun() ->
+                        sync_error_logger:error_msg("~ts", ["Привет!"]),
+                        _ = gen_event:which_handlers(error_logger),
+                        {Level, _, Msg,Metadata} = pop(),
+                        ?assertEqual(lager_util:level_to_num(error),Level),
+                        ?assertEqual(self(),proplists:get_value(pid,Metadata)),
+                        ?assertEqual("Привет!", lists:flatten(Msg))
+                end
+            },
+
             {"error messages are truncated at 4096 characters",
                 fun() ->
                         sync_error_logger:error_msg("doom, doom has come upon you all ~p", [string:copies("doom", 10000)]),
@@ -799,36 +879,70 @@ error_logger_redirect_test_() ->
                         ?assert(length(lists:flatten(Msg)) < 5100)
                 end
             },
+            {"info messages with unicode characters in Args are printed",
+                fun() ->
+                        sync_error_logger:info_msg("~ts", ["Привет!"]),
+                        _ = gen_event:which_handlers(error_logger),
+                        {Level, _, Msg,Metadata} = pop(),
+                        ?assertEqual(lager_util:level_to_num(info),Level),
+                        ?assertEqual(self(),proplists:get_value(pid,Metadata)),
+                        ?assertEqual("Привет!", lists:flatten(Msg))
+                end
+            },
+            {"warning messages with unicode characters in Args are printed",
+             %% See comments at commit 7662a8040d5427907c041ca8e682fe09f6f17d26
+             %% for full details of why using the process dictionary is needed
+             %% for these next 4 tests.
+             %%
+             %% In short, the error level atom used in OTP releases changed
+             %% between 17 and 18 and the default used in sync_error_logger
+             %% isn't right for OTP 18 and later. Storing the expected level
+             %% in the process dictionary makes sync_error_logger use the
+             %% correct level when processing the log messages.
+                fun() ->
+                        Lvl = error_logger:warning_map(),
+                        put(warning_map, Lvl),
+                        sync_error_logger:warning_msg("~ts", ["Привет!"]),
+                        _ = gen_event:which_handlers(error_logger),
+                        {Level, _, Msg,Metadata} = pop(),
+                        ?assertEqual(lager_util:level_to_num(Lvl),Level),
+                        ?assertEqual(self(),proplists:get_value(pid,Metadata)),
+                        ?assertEqual("Привет!", lists:flatten(Msg))
+                end
+            },
 
             {"warning messages are printed at the correct level",
                 fun() ->
+                        Lvl = error_logger:warning_map(),
+                        put(warning_map, Lvl),
                         sync_error_logger:warning_msg("doom, doom has come upon you all"),
-                        Map = error_logger:warning_map(),
                         _ = gen_event:which_handlers(error_logger),
                         {Level, _, Msg,Metadata} = pop(),
-                        ?assertEqual(lager_util:level_to_num(Map),Level),
+                        ?assertEqual(lager_util:level_to_num(Lvl),Level),
                         ?assertEqual(self(),proplists:get_value(pid,Metadata)),
                         ?assertEqual("doom, doom has come upon you all", lists:flatten(Msg))
                 end
             },
             {"warning reports are printed at the correct level",
                 fun() ->
+                        Lvl = error_logger:warning_map(),
+                        put(warning_map, Lvl),
                         sync_error_logger:warning_report([{i, like}, pie]),
-                        Map = error_logger:warning_map(),
                         _ = gen_event:which_handlers(error_logger),
                         {Level, _, Msg,Metadata} = pop(),
-                        ?assertEqual(lager_util:level_to_num(Map),Level),
+                        ?assertEqual(lager_util:level_to_num(Lvl),Level),
                         ?assertEqual(self(),proplists:get_value(pid,Metadata)),
                         ?assertEqual("i: like, pie", lists:flatten(Msg))
                 end
             },
             {"single term warning reports are printed at the correct level",
                 fun() ->
+                        Lvl = error_logger:warning_map(),
+                        put(warning_map, Lvl),
                         sync_error_logger:warning_report({foolish, bees}),
-                        Map = error_logger:warning_map(),
                         _ = gen_event:which_handlers(error_logger),
                         {Level, _, Msg,Metadata} = pop(),
-                        ?assertEqual(lager_util:level_to_num(Map),Level),
+                        ?assertEqual(lager_util:level_to_num(Lvl),Level),
                         ?assertEqual(self(),proplists:get_value(pid,Metadata)),
                         ?assertEqual("{foolish,bees}", lists:flatten(Msg))
                 end
@@ -995,7 +1109,7 @@ error_logger_redirect_test_() ->
                         ?assert(length(lists:flatten(Msg)) < 600)
                 end
             },
-            {"crash reports for 'special processes' should be handled right - function_clause", 
+            {"crash reports for 'special processes' should be handled right - function_clause",
                 fun() ->
                         {ok, Pid} = special_process:start(),
                         unlink(Pid),
@@ -1008,7 +1122,7 @@ error_logger_redirect_test_() ->
                         test_body(Expected, lists:flatten(Msg))
                 end
             },
-            {"crash reports for 'special processes' should be handled right - case_clause", 
+            {"crash reports for 'special processes' should be handled right - case_clause",
                 fun() ->
                         {ok, Pid} = special_process:start(),
                         unlink(Pid),
@@ -1021,7 +1135,7 @@ error_logger_redirect_test_() ->
                         test_body(Expected, lists:flatten(Msg))
                 end
             },
-            {"crash reports for 'special processes' should be handled right - exit", 
+            {"crash reports for 'special processes' should be handled right - exit",
                 fun() ->
                         {ok, Pid} = special_process:start(),
                         unlink(Pid),
@@ -1034,7 +1148,7 @@ error_logger_redirect_test_() ->
                         test_body(Expected, lists:flatten(Msg))
                 end
             },
-            {"crash reports for 'special processes' should be handled right - error", 
+            {"crash reports for 'special processes' should be handled right - error",
                 fun() ->
                         {ok, Pid} = special_process:start(),
                         unlink(Pid),
@@ -1150,15 +1264,21 @@ async_threshold_test_() ->
     {foreach,
         fun() ->
                 error_logger:tty(false),
+                ets:new(async_threshold_test, [set, named_table, public]),
+                ets:insert_new(async_threshold_test, {sync_toggled, 0}),
+                ets:insert_new(async_threshold_test, {async_toggled, 0}),
                 application:load(lager),
                 application:set_env(lager, error_logger_redirect, false),
-                application:set_env(lager, async_threshold, 10),
+                application:set_env(lager, async_threshold, 2),
+                application:set_env(lager, async_threshold_window, 1),
                 application:set_env(lager, handlers, [{?MODULE, info}]),
-                application:start(lager)
+                lager:start()
         end,
         fun(_) ->
                 application:unset_env(lager, async_threshold),
                 application:stop(lager),
+                application:stop(goldrush),
+                ets:delete(async_threshold_test),
                 error_logger:tty(true)
         end,
         [
@@ -1173,14 +1293,27 @@ async_threshold_test_() ->
                         %% serialize on mailbox
                         _ = gen_event:which_handlers(lager_event),
                         timer:sleep(500),
-                        %% there should be a ton of outstanding messages now, so async is false
-                        ?assertEqual(false, lager_config:get(async)),
-                        %% wait for all the workers to return, meaning that all the messages have been logged (since we're in sync mode)
+
+                        %% By now the flood of messages will have
+                        %% forced the backend throttle to turn off
+                        %% async mode, but it's possible all
+                        %% outstanding requests have been processed,
+                        %% so checking the current status (sync or
+                        %% async) is an exercise in race control.
+
+                        %% Instead, we'll see whether the backend
+                        %% throttle has toggled into sync mode at any
+                        %% point in the past
+                        ?assertMatch([{sync_toggled, N}] when N > 0,
+                                                              ets:lookup(async_threshold_test, sync_toggled)),
+                        %% wait for all the workers to return, meaning that all the messages have been logged (since we're definitely in sync mode at the end of the run)
                         collect_workers(Workers),
-                        %% serialize ont  the mailbox again
+                        %% serialize on the mailbox again
                         _ = gen_event:which_handlers(lager_event),
                         %% just in case...
-                        timer:sleep(100),
+                        timer:sleep(1000),
+                        lager:info("hello world"),
+                        _ = gen_event:which_handlers(lager_event),
 
                         %% async is true again now that the mailbox has drained
                         ?assertEqual(true, lager_config:get(async)),
@@ -1197,6 +1330,62 @@ collect_workers(Workers) ->
         {'DOWN', Ref, _, _, _} ->
             collect_workers(lists:keydelete(Ref, 2, Workers))
     end.
+
+produce_n_error_logger_msgs(N) ->
+    lists:foreach(fun (K) ->
+            error_logger:error_msg("Foo ~p!", [K])
+        end,
+        lists:seq(0, N-1)
+    ).
+
+high_watermark_test_() ->
+    {foreach,
+        fun() ->
+            error_logger:tty(false),
+            application:load(lager),
+            application:set_env(lager, error_logger_redirect, true),
+            application:set_env(lager, handlers, [{lager_test_backend, info}]),
+            application:set_env(lager, async_threshold, undefined),
+            lager:start()
+        end,
+        fun(_) ->
+            application:stop(lager),
+            error_logger:tty(true)
+        end,
+        [
+            {"Nothing dropped when error_logger high watermark is undefined",
+                fun () ->
+                    ok = error_logger_lager_h:set_high_water(undefined),
+                    timer:sleep(100),
+                    produce_n_error_logger_msgs(10),
+                    timer:sleep(500),
+                    ?assert(count() >= 10)
+                end
+            },
+            {"Mostly dropped according to error_logger high watermark",
+                fun () ->
+                    ok = error_logger_lager_h:set_high_water(5),
+                    timer:sleep(100),
+                    produce_n_error_logger_msgs(50),
+                    timer:sleep(1000),
+                    ?assert(count() < 20)
+                end
+            },
+            {"Non-notifications are not dropped",
+                fun () ->
+                    ok = error_logger_lager_h:set_high_water(2),
+                    timer:sleep(100),
+                    spawn(fun () -> produce_n_error_logger_msgs(300) end),
+                    timer:sleep(50),
+                    %% if everything were dropped, this call would be dropped
+                    %% too, so lets hope it's not
+                    ?assert(is_integer(count())),
+                    timer:sleep(1000),
+                    ?assert(count() < 10)
+                end
+            }
+        ]
+    }.
 
 -endif.
 

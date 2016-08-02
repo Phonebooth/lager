@@ -61,15 +61,15 @@
         inode :: integer(),
         flap=false :: boolean(),
         size = 0 :: integer(),
-        date,
-        count = 10,
-        formatter,
-        formatter_config,
-        sync_on,
-        check_interval = ?DEFAULT_CHECK_INTERVAL,
-        sync_interval = ?DEFAULT_SYNC_INTERVAL,
-        sync_size = ?DEFAULT_SYNC_SIZE,
-        last_check = os:timestamp(),
+        date :: undefined | string(),
+        count = 10 :: integer(),
+        formatter :: atom(),
+        formatter_config :: any(),
+        sync_on :: {'mask', integer()},
+        check_interval = ?DEFAULT_CHECK_INTERVAL ::non_neg_integer(),
+        sync_interval = ?DEFAULT_SYNC_INTERVAL :: non_neg_integer(),
+        sync_size = ?DEFAULT_SYNC_SIZE :: non_neg_integer(),
+        last_check = os:timestamp() :: erlang:timestamp(),
         sieved = 0
     }).
 
@@ -103,8 +103,9 @@ init(LogFileConfig) when is_list(LogFileConfig) ->
             {error, {fatal, bad_config}};
         Config ->
             %% probabably a better way to do this, but whatever
-            [Name, Level, Date, Size, Count, SyncInterval, SyncSize, SyncOn, CheckInterval, Formatter, FormatterConfig] =
+            [RelName, Level, Date, Size, Count, SyncInterval, SyncSize, SyncOn, CheckInterval, Formatter, FormatterConfig] =
               [proplists:get_value(Key, Config) || Key <- [file, level, date, size, count, sync_interval, sync_size, sync_on, check_interval, formatter, formatter_config]],
+            Name = lager_util:expand_path(RelName),
             schedule_rotation(Name, Date),
             State0 = #state{name=Name, level=Level, size=Size, date=Date, count=Count, formatter=Formatter,
                 formatter_config=FormatterConfig, sync_on=SyncOn, sync_interval=SyncInterval, sync_size=SyncSize,
@@ -171,7 +172,7 @@ log_sieved(_Message, State) ->
 
 %% @private
 handle_info({rotate, File}, #state{name=File,count=Count,date=Date} = State) ->
-    lager_util:rotate_logfile(File, Count),
+    _ = lager_util:rotate_logfile(File, Count),
     schedule_rotation(File, Date),
     {ok, State};
 handle_info(_Info, State) ->
@@ -214,9 +215,19 @@ write(#state{name=Name, fd=FD, inode=Inode, flap=Flap, size=RotSize,
             %% need to check for rotation
             case lager_util:ensure_logfile(Name, FD, Inode, {State#state.sync_size, State#state.sync_interval}) of
                 {ok, {_, _, Size}} when RotSize /= 0, Size > RotSize ->
-                    lager_util:rotate_logfile(Name, Count),
-                    %% go around the loop again, we'll do another rotation check and hit the next clause here
-                    write(State, Timestamp, Level, Msg);
+                    case lager_util:rotate_logfile(Name, Count) of
+                        ok ->
+                            %% go around the loop again, we'll do another rotation check and hit the next clause of ensure_logfile
+                            write(State, Timestamp, Level, Msg);
+                        {error, Reason} ->
+                            case Flap of
+                                true ->
+                                    State;
+                                _ ->
+                                    ?INT_LOG(error, "Failed to rotate log file ~s with error ~s", [Name, file:format_error(Reason)]),
+                                    State#state{flap=true}
+                            end
+                    end;
                 {ok, {NewFD, NewInode, _}} ->
                     %% update our last check and try again
                     do_write(State#state{last_check=Timestamp, fd=NewFD, inode=NewInode}, Level, Msg);
@@ -478,18 +489,22 @@ filesystem_test_() ->
     {foreach,
         fun() ->
                 file:write_file("test.log", ""),
+                file:delete("foo.log"),
+                file:delete("foo.log.0"),
+                file:delete("foo.log.1"),
                 error_logger:tty(false),
                 application:load(lager),
                 application:set_env(lager, handlers, [{lager_test_backend, info}]),
                 application:set_env(lager, error_logger_redirect, false),
                 application:set_env(lager, async_threshold, undefined),
-                application:start(lager)
+                lager:start()
         end,
         fun(_) ->
                 file:delete("test.log"),
                 file:delete("test.log.0"),
                 file:delete("test.log.1"),
                 application:stop(lager),
+                application:stop(goldrush),
                 error_logger:tty(true)
         end,
         [
@@ -515,7 +530,7 @@ filesystem_test_() ->
                 fun() ->
                         %% XXX if this test fails, check that this file is encoded latin-1, not utf-8!
                         gen_event:add_handler(lager_event, lager_file_backend, [{"test.log", info}, {lager_default_formatter}]),
-                        lager:log(error, self(),"~ts", ["LÆÝÎN-ï"]),
+                        lager:log(error, self(),"~ts", [[76, 198, 221, 206, 78, $-, 239]]),
                         {ok, Bin} = file:read_file("test.log"),
                         Pid = pid_to_list(self()),
                         Res = re:split(Bin, " ", [{return, list}, {parts, 5}]),
@@ -621,7 +636,7 @@ filesystem_test_() ->
                         ?assertEqual({ok, <<>>}, file:read_file("test.log")),
                         lager:log(info, self(), "Test message1"),
                         ?assertEqual({ok, <<>>}, file:read_file("test.log")),
-                        timer:sleep(1000),
+                        timer:sleep(2000),
                         {ok, Bin} = file:read_file("test.log"),
                         ?assert(<<>> /= Bin)
                 end
@@ -717,6 +732,36 @@ filesystem_test_() ->
                         {ok, Bin3} = file:read_file("foo.log"),
                         ?assertMatch([_, _, "[error]", _, "Test message\n"], re:split(Bin3, " ", [{return, list}, {parts, 5}]))
                 end
+            },
+            {"tracing to a dedicated file should work even if root_log is set",
+                fun() ->
+                        {ok, P} = file:get_cwd(),
+                        file:delete(P ++ "/test_root_log/foo.log"),
+                        application:set_env(lager, log_root, P++"/test_root_log"),
+                        {ok, _} = lager:trace_file("foo.log", [{module, ?MODULE}]),
+                        lager:error("Test message"),
+                        %% not elegible for trace
+                        lager:log(error, self(), "Test message"),
+                        {ok, Bin3} = file:read_file(P++"/test_root_log/foo.log"),
+                        application:unset_env(lager, log_root),
+                        ?assertMatch([_, _, "[error]", _, "Test message\n"], re:split(Bin3, " ", [{return, list}, {parts, 5}]))
+                end
+            },
+            {"tracing with options should work",
+                fun() ->
+                        file:delete("foo.log"),
+                        {ok, _} = lager:trace_file("foo.log", [{module, ?MODULE}], [{size, 20}, {check_interval, 1}]), 
+                        lager:error("Test message"),
+                        ?assertNot(filelib:is_regular("foo.log.0")),
+                        %% rotation is sensitive to intervals between
+                        %% writes so we sleep to exceed the 1
+                        %% millisecond interval specified by
+                        %% check_interval above
+                        timer:sleep(2),
+                        lager:error("Test message"),
+                        timer:sleep(10),
+                        ?assert(filelib:is_regular("foo.log.0"))
+                end
             }
         ]
     }.
@@ -730,12 +775,13 @@ formatting_test_() ->
                 application:load(lager),
                 application:set_env(lager, handlers, [{lager_test_backend, info}]),
                 application:set_env(lager, error_logger_redirect, false),
-                application:start(lager)
+                lager:start()
         end,
         fun(_) ->
                 file:delete("test.log"),
                 file:delete("test2.log"),
                 application:stop(lager),
+                application:stop(goldrush),
                 error_logger:tty(true)
         end,
             [{"Should have two log files, the second prefixed with 2>",

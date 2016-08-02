@@ -91,7 +91,7 @@ gen_fmt_args() ->
 
 %% Generates a printable string
 gen_print_str() ->
-    ?LET(Xs, list(char()), [X || X <- Xs, io_lib:printable_list([X]), X /= $~, X < 255]).
+    ?LET(Xs, list(char()), [X || X <- Xs, io_lib:printable_list([X]), X /= $~, X < 256]).
 
 gen_print_bin() ->
     ?LET(Xs, gen_print_str(), list_to_binary(Xs)).
@@ -137,7 +137,7 @@ gen_pid() ->
 gen_port() ->
     ?LAZY(begin
               Port = erlang:open_port({spawn, "true"}, []),
-              erlang:port_close(Port),
+              catch(erlang:port_close(Port)),
               Port
           end).
 

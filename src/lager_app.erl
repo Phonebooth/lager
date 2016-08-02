@@ -67,8 +67,8 @@ start(_StartType, _StartArgs) ->
     Handlers = case application:get_env(lager, handlers) of
         undefined ->
             [{lager_console_backend, info},
-                {lager_file_backend, [{"log/error.log", error, 10485760, "", 5},
-                        {"log/console.log", info, 10485760, "", 5}]}];
+             {lager_file_backend, [{file, "log/error.log"},   {level, error}, {size, 10485760}, {date, "$D0"}, {count, 5}]},
+             {lager_file_backend, [{file, "log/console.log"}, {level, info}, {size, 10485760}, {date, "$D0"}, {count, 5}]}];
         {ok, Val} ->
             Val
     end,
@@ -117,7 +117,7 @@ start(_StartType, _StartArgs) ->
                 end
         end,
 
-    lager_util:trace_filter(none), 
+    _ = lager_util:trace_filter(none), 
 
     {ok, Pid, SavedHandlers}.
 
