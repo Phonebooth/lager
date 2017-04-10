@@ -110,6 +110,12 @@ do_log(Severity, Metadata, Format, Args, Size, SeverityAsInt, LevelThreshold, Tr
                 _ ->
                     Format
             end,
+            case lager_config:get(imetrics, false) of
+                true ->
+                    imetrics:add_m(lager, Severity);
+                false ->
+                    ok
+            end,
             LagerMsg = lager_msg:new(Msg,
                 Severity, Metadata, Destinations),
             case lager_config:get(async, false) of
