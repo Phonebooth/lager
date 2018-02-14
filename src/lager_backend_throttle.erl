@@ -41,60 +41,36 @@
 -endif.
 
 -record(state, {
-        hwm,
-        window_min,
-        sieve_threshold,
-        sieve_window,
-        async = true,
-        sieve = false
+        sink :: atom(),
+        hwm :: non_neg_integer(),
+        window_min :: non_neg_integer(),
+        async = true :: boolean()
     }).
 
-init([Hwm, Window, SieveThreshold, SieveWindow]) ->
-    lager_config:set(async, true),
-    lager_config:set(sieve, false),
-    {ok, #state{hwm=Hwm, window_min=Hwm - Window,
-                sieve_threshold=SieveThreshold, sieve_window=SieveWindow}}.
+init([{sink, Sink}, Hwm, Window]) ->
+    lager_config:set({Sink, async}, true),
+    {ok, #state{sink=Sink, hwm=Hwm, window_min=Hwm - Window}}.
 
-handle_call({set_sieve, {Threshold, Window}}, State) ->
-    {ok, ok, State#state{sieve_threshold=Threshold, sieve_window=Window}};
-handle_call({set_sieve_threshold, Threshold}, State) ->
-    {ok, ok, State#state{sieve_threshold=Threshold}};
-handle_call({set_sieve_window, Window}, State) ->
-    {ok, ok, State#state{sieve_window=Window}};
+
 handle_call(get_loglevel, State) ->
-    {ok, undefined, State};
+    {ok, {mask, ?LOG_NONE}, State};
 handle_call({set_loglevel, _Level}, State) ->
     {ok, ok, State};
 handle_call(_Request, State) ->
     {ok, ok, State}.
 
-handle_event({log, _Message},State_) ->
+handle_event({log, _Message},State) ->
     {message_queue_len, Len} = erlang:process_info(self(), message_queue_len),
-
-    State = case {Len > State_#state.sieve_threshold, Len < State_#state.sieve_window, State_#state.sieve} of
-        {true, _, false} ->
-            %% need to flip to sieve mode
-            lager_config:set(sieve, true),
-            State_#state{sieve=true};
-        {_, true, true} ->
-            %% need to flip to sieve mode off
-            lager_config:set(sieve, false),
-            State_#state{sieve=false};
-        _ ->
-            %% nothing needs to change
-            State_
-    end,
-
     case {Len > State#state.hwm, Len < State#state.window_min, State#state.async} of
         {true, _, true} ->
             %% need to flip to sync mode
             ?TOGGLE_SYNC(),
-            lager_config:set(async, false),
+            lager_config:set({State#state.sink, async}, false),
             {ok, State#state{async=false}};
         {_, true, false} ->
             %% need to flip to async mode
             ?TOGGLE_ASYNC(),
-            lager_config:set(async, true),
+            lager_config:set({State#state.sink, async}, true),
             {ok, State#state{async=true}};
         _ ->
             %% nothing needs to change

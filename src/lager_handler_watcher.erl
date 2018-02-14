@@ -38,18 +38,18 @@
 -record(state, {
         module :: atom(),
         config :: any(),
-        event :: pid() | atom()
+        sink :: pid() | atom()
     }).
 
-start_link(Event, Module, Config) ->
-    gen_server:start_link(?MODULE, [Event, Module, Config], []).
+start_link(Sink, Module, Config) ->
+    gen_server:start_link(?MODULE, [Sink, Module, Config], []).
 
-start(Event, Module, Config) ->
-    gen_server:start(?MODULE, [Event, Module, Config], []).
+start(Sink, Module, Config) ->
+    gen_server:start(?MODULE, [Sink, Module, Config], []).
 
-init([Event, Module, Config]) ->
-    install_handler(Event, Module, Config),
-    {ok, #state{event=Event, module=Module, config=Config}}.
+init([Sink, Module, Config]) ->
+    install_handler(Sink, Module, Config),
+    {ok, #state{sink=Sink, module=Module, config=Config}}.
 
 handle_call(_Call, _From, State) ->
     {reply, ok, State}.
@@ -61,19 +61,34 @@ handle_info({gen_event_EXIT, Module, normal}, #state{module=Module} = State) ->
     {stop, normal, State};
 handle_info({gen_event_EXIT, Module, shutdown}, #state{module=Module} = State) ->
     {stop, normal, State};
+handle_info({gen_event_EXIT, Module, {'EXIT', {kill_me, [_KillerHWM, KillerReinstallAfter]}}},
+        #state{module=Module, sink=Sink} = State) ->
+    %% Brutally kill the manager but stay alive to restore settings.
+    %%
+    %% SinkPid here means the gen_event process. Handlers *all* live inside the
+    %% same gen_event process space, so when the Pid is killed, *all* of the 
+    %% pending log messages in its mailbox will die too.
+    SinkPid = whereis(Sink),
+    unlink(SinkPid),
+    exit(SinkPid, kill),
+    erlang:send_after(KillerReinstallAfter, self(), {reboot, Sink}),
+    {noreply, State};
 handle_info({gen_event_EXIT, Module, Reason}, #state{module=Module,
-        config=Config, event=Event} = State) ->
+        config=Config, sink=Sink} = State) ->
     case lager:log(error, self(), "Lager event handler ~p exited with reason ~s",
         [Module, error_logger_lager_h:format_reason(Reason)]) of
       ok ->
-        install_handler(Event, Module, Config);
+        install_handler(Sink, Module, Config);
       {error, _} ->
         %% lager is not working, so installing a handler won't work
         ok
     end,
     {noreply, State};
-handle_info(reinstall_handler, #state{module=Module, config=Config, event=Event} = State) ->
-    install_handler(Event, Module, Config),
+handle_info(reinstall_handler, #state{module=Module, config=Config, sink=Sink} = State) ->
+    install_handler(Sink, Module, Config),
+    {noreply, State};
+handle_info({reboot, Sink}, State) ->
+    _ = lager_app:boot(Sink),
     {noreply, State};
 handle_info(stop, State) ->
     {stop, normal, State};
@@ -87,23 +102,33 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 %% internal
+install_handler(Sink, lager_backend_throttle, Config) ->
+    %% The lager_backend_throttle needs to know to which sink it is
+    %% attached, hence this admittedly ugly workaround. Handlers are
+    %% sensitive to the structure of the configuration sent to `init',
+    %% sadly, so it's not trivial to add a configuration item to be
+    %% ignored to backends without breaking 3rd party handlers.
+    install_handler2(Sink, lager_backend_throttle, [{sink, Sink}|Config]);
+install_handler(Sink, Module, Config) ->
+    install_handler2(Sink, Module, Config).
 
-install_handler(Event, Module, Config) ->
-    case gen_event:add_sup_handler(Event, Module, Config) of
+%% private
+install_handler2(Sink, Module, Config) ->
+    case gen_event:add_sup_handler(Sink, Module, Config) of
         ok ->
-            ?INT_LOG(debug, "Lager installed handler ~p into ~p", [Module, Event]),
-            lager:update_loglevel_config(),
+            ?INT_LOG(debug, "Lager installed handler ~p into ~p", [Module, Sink]),
+            lager:update_loglevel_config(Sink),
             ok;
         {error, {fatal, Reason}} ->
             ?INT_LOG(error, "Lager fatally failed to install handler ~p into"
-                " ~p, NOT retrying: ~p", [Module, Event, Reason]),
+                " ~p, NOT retrying: ~p", [Module, Sink, Reason]),
             %% tell ourselves to stop
             self() ! stop,
             ok;
         Error ->
             %% try to reinstall it later
             ?INT_LOG(error, "Lager failed to install handler ~p into"
-               " ~p, retrying later : ~p", [Module, Event, Error]),
+               " ~p, retrying later : ~p", [Module, Sink, Error]),
             erlang:send_after(5000, self(), reinstall_handler),
             ok
     end.
@@ -125,11 +150,10 @@ reinstall_on_initial_failure_test_() ->
                     application:unset_env(lager, crash_log),
                     lager:start(),
                     try
-                      ?assertEqual(1, lager_test_backend:count()),
                       {_Level, _Time, Message, _Metadata} = lager_test_backend:pop(),
                       ?assertMatch("Lager failed to install handler lager_crash_backend into lager_event, retrying later :"++_, lists:flatten(Message)),
-                      ?assertEqual(0, lager_test_backend:count()),
                       timer:sleep(6000),
+                      lager_test_backend:flush(),
                       ?assertEqual(0, lager_test_backend:count()),
                       ?assert(lists:member(lager_crash_backend, gen_event:which_handlers(lager_event)))
                     after
@@ -152,14 +176,12 @@ reinstall_on_runtime_failure_test_() ->
                     application:unset_env(lager, crash_log),
                     lager:start(),
                     try
-                        ?assertEqual(0, lager_test_backend:count()),
                         ?assert(lists:member(lager_crash_backend, gen_event:which_handlers(lager_event))),
                         timer:sleep(6000),
-                        ?assertEqual(2, lager_test_backend:count()),
-                        {_Severity, _Date, Msg, _Metadata} = lager_test_backend:pop(),
-                        ?assertEqual("Lager event handler lager_crash_backend exited with reason crash", lists:flatten(Msg)),
-                        {_Severity2, _Date2, Msg2, _Metadata2} = lager_test_backend:pop(),
-                        ?assertMatch("Lager failed to install handler lager_crash_backend into lager_event, retrying later :"++_, lists:flatten(Msg2)),
+
+                        pop_until("Lager event handler lager_crash_backend exited with reason crash", fun lists:flatten/1),
+                        pop_until("Lager failed to install handler lager_crash_backend into lager_event, retrying later",
+                                  fun(Msg) -> string:substr(lists:flatten(Msg), 1, 84) end),
                         ?assertEqual(false, lists:member(lager_crash_backend, gen_event:which_handlers(lager_event)))
                     after
                        application:stop(lager),
@@ -170,5 +192,17 @@ reinstall_on_runtime_failure_test_() ->
         ]
     }.
 
+pop_until(String, Fun) ->
+    try_backend_pop(lager_test_backend:pop(), String, Fun).
+
+try_backend_pop(undefined, String, _Fun) ->
+    throw("Not found: " ++ String);
+try_backend_pop({_Severity, _Date, Msg, _Metadata}, String, Fun) ->
+    case Fun(Msg) of
+        String ->
+            ok;
+        _ ->
+            try_backend_pop(lager_test_backend:pop(), String, Fun)
+    end.
 
 -endif.
