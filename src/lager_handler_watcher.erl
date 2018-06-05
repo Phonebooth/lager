@@ -76,7 +76,7 @@ handle_info({gen_event_EXIT, Module, {'EXIT', {kill_me, [_KillerHWM, KillerReins
 handle_info({gen_event_EXIT, Module, Reason}, #state{module=Module,
         config=Config, sink=Sink} = State) ->
     case lager:log(error, self(), "Lager event handler ~p exited with reason ~s",
-        [Module, error_logger_lager_h:format_reason(Reason)]) of
+        [Module, Reason]) of
       ok ->
         install_handler(Sink, Module, Config);
       {error, _} ->
