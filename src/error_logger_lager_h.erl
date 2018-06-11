@@ -206,7 +206,7 @@ log_event(Event, #state{sink=Sink} = State) ->
                     {Type, Name, StateName, Reason} = case Args of
                         [TName, _Msg, TStateName, _StateData, TReason] ->
                             {gen_fsm, TName, TStateName, TReason};
-                        [TName, _Msg, error, TReason, _StateData, Stacktrace] ->
+                        [TName, _Msg, _ExitType, TReason, _StateData, Stacktrace] ->
                             {gen_statem, TName, init, {TReason, Stacktrace}};
                         [TName, _Msg, {TStateName, _StateData}, _ExitType, TReason, _FsmType, Stacktrace] ->
                             {gen_statem, TName, TStateName, {TReason, Stacktrace}};
