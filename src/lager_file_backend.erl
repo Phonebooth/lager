@@ -83,6 +83,8 @@
                   {size, non_neg_integer()} | {date, string()} |
                   {count, non_neg_integer()} | {rotator, atom()} |
                   {high_water_mark, non_neg_integer()} |
+                  {flush_queue, boolean()} |
+                  {flush_threshold, non_neg_integer()} |
                   {sync_interval, non_neg_integer()} |
                   {sync_size, non_neg_integer()} | {sync_on, lager:log_level()} |
                   {check_interval, non_neg_integer()} | {formatter, atom()} |
@@ -158,10 +160,28 @@ handle_call(_Request, State) ->
 
 %% @private
 handle_event({log, Message},
-    #state{name=Name, level=L,formatter=Formatter,formatter_config=FormatConfig} = State) ->
+    #state{name=Name, level=L,formatter=Formatter,formatter_config=FormatConfig,shaper=Shaper} = State) ->
     case lager_util:is_loggable(Message,L,{lager_file_backend, Name}) of
         true ->
-            {ok,write(State, lager_msg:timestamp(Message), lager_msg:severity_as_int(Message), Formatter:format(Message,FormatConfig)) };
+            case lager_util:check_hwm(Shaper) of
+                {true, Drop, #lager_shaper{hwm=Hwm} = NewShaper} ->
+                    NewState = case Drop > 0 of
+                        true ->
+                            Report = io_lib:format(
+                                "lager_file_backend dropped ~p messages in the last second that exceeded the limit of ~p messages/sec",
+                                [Drop, Hwm]),
+                            ReportMsg = lager_msg:new(Report, warning, [], []),
+                            write(State, lager_msg:timestamp(ReportMsg),
+                                lager_msg:severity_as_int(ReportMsg), Formatter:format(ReportMsg, FormatConfig));
+                        false ->
+                            State
+                    end,
+                    {ok,write(NewState#state{shaper=NewShaper},
+                        lager_msg:timestamp(Message), lager_msg:severity_as_int(Message),
+                        Formatter:format(Message,FormatConfig))};
+                {false, _, #lager_shaper{dropped=D} = NewShaper} ->
+                    {ok, State#state{shaper=NewShaper#lager_shaper{dropped=D+1}}}
+            end;
         false ->
             {ok, State}
     end;
@@ -186,7 +206,7 @@ handle_info({shaper_expired, Name}, #state{shaper=Shaper, name=Name, formatter=F
             write(State, lager_msg:timestamp(ReportMsg),
                   lager_msg:severity_as_int(ReportMsg), Formatter:format(ReportMsg, FormatConfig))
     end,
-    {ok, State#state{shaper=Shaper#lager_shaper{dropped=0, mps=1, lasttime=os:timestamp()}}};
+    {ok, State#state{shaper=Shaper#lager_shaper{dropped=0, mps=0, lasttime=os:timestamp()}}};
 handle_info(_Info, State) ->
     {ok, State}.
 
@@ -413,10 +433,10 @@ validate_logfile_proplist([{flush_queue, FlushCfg}|Tail], Acc) ->
         false ->
             throw({bad_config, "Invalid queue flush flag", FlushCfg})
     end;
-validate_logfile_proplist([{flush_queue_threshold, Thr}|Tail], Acc) ->
+validate_logfile_proplist([{flush_threshold, Thr}|Tail], Acc) ->
     case Thr of
         _ when is_integer(Thr), Thr >= 0 ->
-            validate_logfile_proplist(Tail, [{flush_queue_threshold, Thr}|Acc]);
+            validate_logfile_proplist(Tail, [{flush_threshold, Thr}|Acc]);
         _ ->
             throw({bad_config, "Invalid queue flush threshold", Thr})
     end;
@@ -864,6 +884,7 @@ filesystem_test_() ->
 
             gen_event:add_handler(lager_event, lager_file_backend,
                 [{file, TestLog}, {level, critical}, {check_interval, always}]),
+            timer:sleep(500),
             lager:critical("Test message"),
             {ok, Bin1} = file:read_file(TestLog),
             ?assertMatch([_, _, "[critical]", _, "Test message\n"],
@@ -936,6 +957,23 @@ filesystem_test_() ->
             timer:sleep(10),
             ?assert(filelib:is_regular(TestLog0)),
 
+            lager_util:delete_test_dir(TestDir)
+        end},
+        {"no silent hwm drops",
+        fun() ->
+            TestDir = lager_util:create_test_dir(),
+            TestLog = filename:join(TestDir, "test.log"),
+            gen_event:add_handler(lager_event, lager_file_backend, [{file, TestLog}, {level, info},
+                {high_water_mark, 5}, {flush_queue, false}, {sync_on, "=warning"}]),
+            {_, _, MS} = os:timestamp(),
+            timer:sleep((1000000 - MS) div 1000 + 1),
+            %start close to the beginning of a new second
+            [lager:log(info, self(), "Foo ~p", [K]) || K <- lists:seq(1, 15)],
+            timer:sleep(1000),
+            {ok, Bin} = file:read_file(TestLog),
+            Last = lists:last(re:split(Bin, "\n", [{return, list}, trim])),
+            ?assertMatch([_, _, _, _, "lager_file_backend dropped 10 messages in the last second that exceeded the limit of 5 messages/sec"],
+                re:split(Last, " ", [{return, list}, {parts, 5}])),
             lager_util:delete_test_dir(TestDir)
         end}
     ]}.

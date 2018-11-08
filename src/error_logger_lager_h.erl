@@ -121,8 +121,8 @@ handle_event(Event, #state{sink=Sink, shaper=Shaper} = State) ->
                 "lager_error_logger_h dropped ~p messages in the last second that exceeded the limit of ~p messages/sec",
                 [Drop, Hwm]),
             eval_gl(Event, State#state{shaper=NewShaper});
-        {false, _, NewShaper} ->
-            {ok, State#state{shaper=NewShaper}}
+        {false, _, #lager_shaper{dropped=D} = NewShaper} ->
+            {ok, State#state{shaper=NewShaper#lager_shaper{dropped=D+1}}}
     end.
 
 handle_info({shaper_expired, ?MODULE}, #state{sink=Sink, shaper=Shaper} = State) ->
@@ -134,7 +134,7 @@ handle_info({shaper_expired, ?MODULE}, #state{sink=Sink, shaper=Shaper} = State)
                     "lager_error_logger_h dropped ~p messages in the last second that exceeded the limit of ~p messages/sec",
                     [Dropped, Shaper#lager_shaper.hwm])
     end,
-    {ok, State#state{shaper=Shaper#lager_shaper{dropped=0, mps=1, lasttime=os:timestamp()}}};
+    {ok, State#state{shaper=Shaper#lager_shaper{dropped=0, mps=0, lasttime=os:timestamp()}}};
 handle_info(_Info, State) ->
     {ok, State}.
 
@@ -210,10 +210,12 @@ log_event(Event, #state{sink=Sink} = State) ->
                             {gen_statem, TName, init, {TReason, Stacktrace}};
                         [TName, _Msg, {TStateName, _StateData}, _ExitType, TReason, _FsmType, Stacktrace] ->
                             {gen_statem, TName, TStateName, {TReason, Stacktrace}};
+                        [TName, _Msg, [{TStateName, _StateData}], _ExitType, TReason, _FsmType, Stacktrace] ->
+                            %% sometimes gen_statem wraps its statename/data in a list for some reason???
+                            {gen_statem, TName, TStateName, {TReason, Stacktrace}};
                         _ ->
-			    ?LOGFMT(Sink, error, [], "Unexpected state machine arg list ~p ~p",
-					[length(Args), Args])
-
+                            ?LOGFMT(Sink, error, [], "Unexpected state machine arg list ~p ~p",
+                                    [length(Args), Args])
                     end,
                     {Md, Formatted} = format_reason_md(Reason),
                     ?CRASH_LOG(Event),
@@ -247,6 +249,13 @@ log_event(Event, #state{sink=Sink} = State) ->
                     %% Ranch errors
                     ?CRASH_LOG(Event),
                     case Args of
+                        %% Error logged by cowboy, which starts as ranch error
+                        [Ref, ConnectionPid, StreamID, RequestPid, Reason, StackTrace] ->
+                            {Md, Formatted} = format_reason_md({Reason, StackTrace}),
+                            ?LOGFMT(Sink, error, [{pid, RequestPid} | Md],
+                                "Cowboy stream ~p with ranch listener ~p and connection process ~p "
+                                "had its request process exit with reason: ~s",
+                                [StreamID, Ref, ConnectionPid, Formatted]);
                         [Ref, _Protocol, Worker, {[{reason, Reason}, {mfa, {Module, Function, Arity}}, {stacktrace, StackTrace} | _], _}] ->
                             {Md, Formatted} = format_reason_md({Reason, StackTrace}),
                             ?LOGFMT(Sink, error, [{pid, Worker} | Md],
@@ -602,3 +611,44 @@ get_value(Key, List, Default) ->
 
 supervisor_name({local, Name}) -> Name;
 supervisor_name(Name) -> Name.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+no_silent_hwm_drops_test_() ->
+    {timeout, 10000,
+        [
+            fun() ->
+                error_logger:tty(false),
+                application:load(lager),
+                application:set_env(lager, handlers, [{lager_test_backend, warning}]),
+                application:set_env(lager, error_logger_redirect, true),
+                application:set_env(lager, error_logger_hwm, 5),
+                application:set_env(lager, error_logger_flush_queue, false),
+                application:set_env(lager, suppress_supervisor_start_stop, true),
+                application:set_env(lager, suppress_application_start_stop, true),
+                application:unset_env(lager, crash_log),
+                lager:start(),
+                try
+                    {_, _, MS} = os:timestamp(),
+                    timer:sleep((1000000 - MS) div 1000 + 1),
+                    %start close to the beginning of a new second
+                    [error_logger:error_msg("Foo ~p~n", [K]) || K <- lists:seq(1, 15)],
+                    timer:sleep(1000),
+                    lager_handler_watcher:pop_until("lager_error_logger_h dropped 10 messages in the last second that exceeded the limit of 5 messages/sec",
+                        fun lists:flatten/1),
+                    %and once again
+                    [error_logger:error_msg("Foo1 ~p~n", [K]) || K <- lists:seq(1, 20)],
+                    timer:sleep(1000),
+                    lager_handler_watcher:pop_until("lager_error_logger_h dropped 15 messages in the last second that exceeded the limit of 5 messages/sec",
+                        fun lists:flatten/1)
+                after
+                    application:stop(lager),
+                    application:stop(goldrush),
+                    error_logger:tty(true)
+                end
+            end
+        ]
+    }.
+
+-endif.

@@ -158,24 +158,30 @@ start_error_logger_handler(true, HWM, WhiteList) ->
                         throw({error, bad_config})
                 end,
 
+    case whereis(error_logger) of
+        undefined ->
+            %% On OTP 21 and above, error_logger is deprecated in favor of 'logger'
+            %% As a band-aid, boot up error_logger anyway and install it as a logger handler
+            %% we can't use error_logger:add_report_handler because we want supervision of the handler
+            %% so we have to manually add the logger handler
+            %%
+            %% Longer term we should be installing a logger handler instead, but this will bridge the gap
+            %% for now.
+            error_logger:start(),
+            _ = logger:add_handler(error_logger,error_logger,#{level=>info,filter_default=>log});
+        _ ->
+            ok
+    end,
 
-    _ = case supervisor:start_child(lager_handler_watcher_sup, [error_logger, error_logger_lager_h, [HWM, GlStrategy]]) of
+    %% capture which handlers we removed from error_logger so we can restore them when lager stops
+    OldHandlers = case supervisor:start_child(lager_handler_watcher_sup, [error_logger, error_logger_lager_h, [HWM, GlStrategy]]) of
         {ok, _} ->
             [begin error_logger:delete_report_handler(X), X end ||
                 X <- gen_event:which_handlers(error_logger) -- [error_logger_lager_h | WhiteList]];
         {error, _} ->
             []
     end,
-
-    Handlers = case application:get_env(lager, handlers) of
-        undefined ->
-            [{lager_console_backend, info},
-             {lager_file_backend, [{file, "log/error.log"},   {level, error}, {size, 10485760}, {date, "$D0"}, {count, 5}]},
-             {lager_file_backend, [{file, "log/console.log"}, {level, info}, {size, 10485760}, {date, "$D0"}, {count, 5}]}];
-        {ok, Val} ->
-            Val
-    end,
-    Handlers.
+    OldHandlers.
 
 configure_sink(Sink, SinkDef) ->
     lager_config:new_sink(Sink),
@@ -304,11 +310,11 @@ application_config_mangling_test_() ->
     [
         {"Explode the file backend handlers",
             ?_assertMatch(
-                [{lager_console_backend, info},
+                [{lager_console_backend, [{level, info}]},
                     {{lager_file_backend,"error.log"},{"error.log",error,10485760, "$D0",5}},
                     {{lager_file_backend,"console.log"},{"console.log",info,10485760, "$D0",5}}
                 ],
-                expand_handlers([{lager_console_backend, info},
+                expand_handlers([{lager_console_backend, [{level, info}]},
                         {lager_file_backend, [
                                 {"error.log", error, 10485760, "$D0", 5},
                                 {"console.log", info, 10485760, "$D0", 5}
@@ -317,11 +323,11 @@ application_config_mangling_test_() ->
         },
         {"Explode the short form of backend file handlers",
             ?_assertMatch(
-                [{lager_console_backend, info},
+                [{lager_console_backend, [{level, info}]},
                     {{lager_file_backend,"error.log"},{"error.log",error}},
                     {{lager_file_backend,"console.log"},{"console.log",info}}
                 ],
-                expand_handlers([{lager_console_backend, info},
+                expand_handlers([{lager_console_backend, [{level, info}]},
                         {lager_file_backend, [
                                 {"error.log", error},
                                 {"console.log", info}
@@ -367,7 +373,7 @@ application_config_mangling_test_() ->
 
 check_handler_config_test_() ->
     Good = expand_handlers(?DEFAULT_HANDLER_CONF),
-    Bad  = expand_handlers([{lager_console_backend, info},
+    Bad  = expand_handlers([{lager_console_backend, [{level, info}]},
             {lager_file_backend, [{file, "same_file.log"}]},
             {lager_file_backend, [{file, "same_file.log"}, {level, info}]}]),
     AlsoBad = [{lager_logstash_backend,
@@ -376,7 +382,7 @@ check_handler_config_test_() ->
                                     {format, json},
                                     {json_encoder, jiffy}}],
     BadToo = [{fail, {fail}}],
-    OldSchoolLagerGood = expand_handlers([{lager_console_backend,info},
+    OldSchoolLagerGood = expand_handlers([{lager_console_backend, [{level, info}]},
                                           {lager_file_backend, [
                                               {"./log/error.log",error,10485760,"$D0",5},
                                               {"./log/console.log",info,10485760,"$D0",5},

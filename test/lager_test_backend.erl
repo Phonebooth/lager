@@ -825,7 +825,9 @@ setup() ->
     %% This race condition was first exposed during the work on
     %% 4b5260c4524688b545cc12da6baa2dfa4f2afec9 which introduced the lager
     %% manager killer PR.
-    timer:sleep(5),
+    application:set_env(lager, suppress_supervisor_start_stop, true),
+    application:set_env(lager, suppress_application_start_stop, true),
+    timer:sleep(1000),
     gen_event:call(lager_event, ?MODULE, flush).
 
 cleanup(_) ->
@@ -934,14 +936,14 @@ kill_crasher(RegName) ->
         Pid -> exit(Pid, kill)
     end.
 
-spawn_fsm_crash(Module) ->
-    spawn(fun() -> Module:crash() end),
+spawn_fsm_crash(Module, Function, Args) ->
+    spawn(fun() -> erlang:apply(Module, Function, Args) end),
     timer:sleep(100),
     _ = gen_event:which_handlers(error_logger),
     ok.
 
 crash_fsm_test_() ->
-    TestBody = fun(Name, FsmModule, Expected) ->
+    TestBody = fun(Name, FsmModule, FSMFunc, FSMArgs, Expected) ->
                    fun(Sink) ->
                       {Name,
                        fun() ->
@@ -949,7 +951,7 @@ crash_fsm_test_() ->
                                 {true, true} -> ok;
                                 _ ->
                                     Pid = whereis(FsmModule),
-                                    spawn_fsm_crash(FsmModule),
+                                    spawn_fsm_crash(FsmModule, FSMFunc, FSMArgs),
                                     {Level, _, Msg, Metadata} = pop(Sink),
                                     test_body(Expected, lists:flatten(Msg)),
                                     ?assertEqual(Pid, proplists:get_value(pid, Metadata)),
@@ -969,8 +971,10 @@ crash_fsm_test_() ->
             }
         end,
 
-        TestBody("gen_fsm crash", crash_fsm, "gen_fsm crash_fsm in state state1 terminated with reason: call to undefined function crash_fsm:state1/3 from gen_fsm:handle_msg/"),
-        TestBody("gen_statem crash", crash_statem, "gen_statem crash_statem in state state1 terminated with reason: no function clause matching crash_statem:handle")
+        TestBody("gen_fsm crash", crash_fsm, crash, [], "gen_fsm crash_fsm in state state1 terminated with reason: call to undefined function crash_fsm:state1/3 from gen_fsm:handle_msg/"),
+        TestBody("gen_statem crash", crash_statem, crash, [], "gen_statem crash_statem in state state1 terminated with reason: no function clause matching crash_statem:handle"),
+        TestBody("gen_statem stop", crash_statem, stop, [explode], "gen_statem crash_statem in state state1 terminated with reason: explode"),
+        TestBody("gen_statem timeout", crash_statem, timeout, [], "gen_statem crash_statem in state state1 terminated with reason: timeout")
     ],
 
     {"FSM crash output tests", [
@@ -1048,9 +1052,11 @@ error_logger_redirect_setup() ->
     application:load(lager),
     application:set_env(lager, error_logger_redirect, true),
     application:set_env(lager, handlers, [{?MODULE, info}]),
+    application:set_env(lager, suppress_supervisor_start_stop, false),
+    application:set_env(lager, suppress_application_start_stop, false),
     lager:start(),
     lager:log(error, self(), "flush flush"),
-    timer:sleep(100),
+    timer:sleep(1000),
     gen_event:call(lager_event, ?MODULE, flush),
     lager_event.
 
@@ -1062,9 +1068,11 @@ error_logger_redirect_setup_sink() ->
     application:set_env(lager, extra_sinks, [
         {error_logger_lager_event, [
             {handlers, [{?MODULE, info}]}]}]),
+    application:set_env(lager, suppress_supervisor_start_stop, false),
+    application:set_env(lager, suppress_application_start_stop, false),
     lager:start(),
     lager:log(error_logger_lager_event, error, self(), "flush flush", []),
-    timer:sleep(100),
+    timer:sleep(1000),
     gen_event:call(error_logger_lager_event, ?MODULE, flush),
     error_logger_lager_event.
 
@@ -1565,6 +1573,26 @@ error_logger_redirect_test_() ->
                         ?assertEqual(lager_util:level_to_num(error),Level),
                         ?assertEqual(self(),proplists:get_value(pid,Metadata)),
                         ?assertEqual("Cowboy handler my_handler terminated with reason: call to undefined function my_handler:to_json/2", lists:flatten(Msg))
+                end
+            },
+            {"Cowboy error reports, 6 arg version",
+             fun(Sink) ->
+                        Stack = [{app_http, init, 2, [{file, "app_http.erl"}, {line,9}]},
+                                 {cowboy_handler, execute, 2, [{file, "cowboy_handler.erl"}, {line, 41}]}],
+                        ConnectionPid = list_to_pid("<0.82.0>"),
+                        sync_error_logger:error_msg(
+                            "Ranch listener ~p, connection process ~p, stream ~p "
+                            "had its request process ~p exit with reason "
+                            "~999999p and stacktrace ~999999p~n",
+                            [my_listner, ConnectionPid, 1, self(), {badmatch, 2}, Stack]),
+                        _ = gen_event:which_handlers(error_logger),
+                        {Level, _, Msg, Metadata} = pop(Sink),
+                        ?assertEqual(lager_util:level_to_num(error), Level),
+                        ?assertEqual(self(), proplists:get_value(pid, Metadata)),
+                        ?assertEqual("Cowboy stream 1 with ranch listener my_listner and "
+                                     "connection process <0.82.0> had its request process exit "
+                                     "with reason: no match of right hand value 2 "
+                                     "in app_http:init/2 line 9", lists:flatten(Msg))
                 end
             },
             {"messages should not be generated if they don't satisfy the threshold",
