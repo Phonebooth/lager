@@ -360,9 +360,9 @@ It is probably best to keep this number small.
 
 When the high-water mark is exceeded, lager can be configured to flush all
 event notifications in the message queue. This can have unintended consequences
-for other handlers in the same event manager (in e.g. the `error_logger'), as
+for other handlers in the same event manager (in e.g. the `error_logger`), as
 events they rely on may be wrongly discarded. By default, this behavior is enabled,
-but can be controlled, for the `error_logger' via:
+but can be controlled, for the `error_logger` via:
 
 ```erlang
 {error_logger_flush_queue, true | false}
@@ -372,6 +372,7 @@ or for a specific sink, using the option:
 
 ```erlang
 {flush_queue, true | false}
+```
 
 If `flush_queue` is true, a message queue length threshold can be set, at which
 messages will start being discarded. The default threshold is `0`, meaning that
@@ -962,6 +963,71 @@ level of your application, you can use these configs to turn it off:
          {suppress_supervisor_start_stop, true}]}
 ```
 
+Sys debug functions
+--------------------
+
+Lager provides an integrated way to use sys 'debug functions'. You can install a debug
+function in a target process by doing
+
+```erlang
+lager:install_trace(Pid, notice).
+```
+
+You can also customize the tracing somewhat:
+
+```erlang
+lager:install_trace(Pid, notice, [{count, 100}, {timeout, 5000}, {format_string, "my trace event ~p ~p"]}).
+```
+
+The trace options are currently:
+
+* timeout - how long the trace stays installed: `infinity` (the default) or a millisecond timeout
+* count - how many trace events to log: `infinity` (default) or a positive number
+* format_string - the format string to log the event with. *Must* have 2 format specifiers for the 2 parameters supplied.
+
+This will, on every 'system event' for an OTP process (usually inbound messages, replies
+and state changes) generate a lager message at the specified log level.
+
+You can remove the trace when you're done by doing:
+
+```erlang
+lager:remove_trace(Pid).
+```
+
+If you want to start an OTP process with tracing enabled from the very beginning, you can do something like this:
+
+```erlang
+gen_server:start_link(mymodule, [], [{debug, [{install, {fun lager:trace_func/3, lager:trace_state(undefined, notice, [])}}]}]).
+```
+
+The third argument to the trace_state function is the Option list documented above.
+
+Console output to another group leader process
+----------------------------------------------
+
+If you want to send your console output to another group_leader (typically on
+another node) you can provide a `{group_leader, Pid}` argument to the console
+backend. This can be combined with another console config option, `id` and
+gen_event's `{Module, ID}` to allow remote tracing of a node to standard out via
+nodetool:
+
+```erlang
+    GL = erlang:group_leader(),
+    Node = node(GL),
+    lager_app:start_handler(lager_event, {lager_console_backend, Node},
+         [{group_leader, GL}, {level, none}, {id, {lager_console_backend, Node}}]),
+    case lager:trace({lager_console_backend, Node}, Filter, Level) of
+         ...
+```
+
+In the above example, the code is assumed to be running via a `nodetool rpc`
+invocation so that the code is executing on the Erlang node, but the
+group_leader is that of the reltool node (eg. appname_maint_12345@127.0.0.1).
+
+If you intend to use tracing with this feature, make sure the second parameter
+to start_handler and the `id` parameter match. Thus when the custom group_leader
+process exits, lager will remove any associated traces for that handler.
+
 Elixir Support
 --------------
 
@@ -981,10 +1047,10 @@ This approach will benefit from the fact that most elixir libs and frameworks
 are likely to use the elixir Logger and as such logging will all flow via the
 same logging mechanism.
 
-In [elixir 2.0 support for parse transforms will be deprecated](https://github.com/elixir-lang/elixir/issues/5762).
+In [elixir 1.5 support for parse transforms was deprecated](https://github.com/elixir-lang/elixir/issues/5762).
 Taking the "Lager as a Logger Backend" approach is likely bypass any related 
 regression issues that would be introduced into a project which is using lager 
-directly when updating to elixir 2.0.
+directly when updating to elixir 1.5.
 
 There are open source elixir Logger backends for Lager available:
 - [LagerLogger](https://github.com/PSPDFKit-labs/lager_logger)
@@ -992,10 +1058,10 @@ There are open source elixir Logger backends for Lager available:
 
 ### Directly
 
-It is fully possible prior to elixir 2.0 to use lager and all its features
+It is fully possible prior to elixir 1.5 to use lager and all its features
 directly.
 
-After elixir 2.0 there will be no support for parse transforms, and it would be
+After elixir 1.5 there is no support for parse transforms, and it is
 recommended to use an elixir wrapper for the lager api that provides compile time
 log level exclusion via elixir macros when opting for direct use of lager.
 
@@ -1054,6 +1120,43 @@ Example Usage:
 
 3.x Changelog
 -------------
+3.6.7 - 14 October 2018
+    * Bugfix: fix tracing to work with OTP21 #480
+
+3.6.6 - 24 September 2018
+
+    * Bugfix: When printing records, handle an improper list correctly. #478
+    * Bugfix: Fix various tests and make some rotation code more explicit. #476
+    * Bugfix: Make sure not to miscount messages during high-water mark check. #475
+
+3.6.5 - 3 September 2018
+
+    * Feature: Allow the console backend to redirect output to a remote node #469
+    * Feature: is_loggble - support for severity as atom #472
+    * Bugfix: Prevent silent dropping of messages when hwm is exceeded #467
+    * Bugfix: rotation - default log file not deleted #474
+    * Bugfix: Handle strange crash report from gen_statem #473
+    * Documentation: Various markup fixes: #468 #470
+
+3.6.4 - 11 July 2018
+
+    * Bugfix: Reinstall handlers after a sink is killed #459
+    * Bugfix: Fix platform_define matching not to break on OSX Mojave #461
+    * Feature: Add support for installing a sys trace function #462
+
+3.6.3 - 6 June 2018
+
+    * OTP 21 support
+
+3.6.2 - 26 April 2018
+
+    * Bugfix: flush_threshold not working (#449)
+    * Feature: Add `node` as a formatting option (#447)
+    * Documentation: Update Elixir section with information about parse_transform (#446)
+    * Bugfix: Correct default console configuation to use "[{level,info}]" instead (#445)
+    * Feature: Pretty print lists of records at top level and field values with lager:pr (#442)
+    * Bugfix: Ignore return value of lager:dispatch_log in lager.hrl (#441)
+
 3.6.1 - 1 February 2018
 
     * Bugfix: Make a few corrections to the recent mailbox flushing changes (#436)

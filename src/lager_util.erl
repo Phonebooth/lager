@@ -268,9 +268,8 @@ calculate_next_rotation([{day, Day}|T], {Date, _Time} = Now) ->
     end,
     case AdjustedDay of
         DoW -> %% rotation is today
-            OldDate = element(1, Now),
             case calculate_next_rotation(T, Now) of
-                {OldDate, _} = NewNow -> NewNow;
+                {Date, _} = NewNow -> NewNow;
                 {NewDate, _} ->
                     %% rotation *isn't* today! rerun the calculation
                     NewNow = {NewDate, {0, 0, 0}},
@@ -293,9 +292,8 @@ calculate_next_rotation([{date, last}|T], {{Year, Month, Day}, _} = Now) ->
     Last = calendar:last_day_of_the_month(Year, Month),
     case Last == Day of
         true -> %% doing rotation today
-            OldDate = element(1, Now),
             case calculate_next_rotation(T, Now) of
-                {OldDate, _} = NewNow -> NewNow;
+                {{Year, Month, Day}, _} = NewNow -> NewNow;
                 {NewDate, _} ->
                     %% rotation *isn't* today! rerun the calculation
                     NewNow = {NewDate, {0, 0, 0}},
@@ -305,11 +303,10 @@ calculate_next_rotation([{date, last}|T], {{Year, Month, Day}, _} = Now) ->
             NewNow = setelement(1, Now, {Year, Month, Last}),
             calculate_next_rotation(T, NewNow)
     end;
-calculate_next_rotation([{date, Date}|T], {{_, _, Date}, _} = Now) ->
+calculate_next_rotation([{date, Date}|T], {{Year, Month, Date}, _} = Now) ->
     %% rotation is today
-    OldDate = element(1, Now),
     case calculate_next_rotation(T, Now) of
-        {OldDate, _} = NewNow -> NewNow;
+        {{Year, Month, Date}, _} = NewNow -> NewNow;
         {NewDate, _} ->
             %% rotation *isn't* today! rerun the calculation
             NewNow = setelement(1, Now, NewDate),
@@ -444,7 +441,9 @@ is_loggable(Msg, {mask, Mask}, MyName) ->
     %?debugFmt("comparing masks ~.2B and ~.2B -> ~p~n", [S, Mask, S band Mask]),
     (lager_msg:severity_as_int(Msg) band Mask) /= 0 orelse
     lists:member(MyName, lager_msg:destinations(Msg));
-is_loggable(Msg ,SeverityThreshold,MyName) ->
+is_loggable(Msg, SeverityThreshold, MyName) when is_atom(SeverityThreshold) ->
+    is_loggable(Msg, level_to_num(SeverityThreshold), MyName);
+is_loggable(Msg, SeverityThreshold, MyName) when is_integer(SeverityThreshold) ->
     lager_msg:severity_as_int(Msg) =< SeverityThreshold orelse
     lists:member(MyName, lager_msg:destinations(Msg)).
 
@@ -502,9 +501,15 @@ check_hwm(Shaper = #lager_shaper{filter = Filter}, Event) ->
 
 check_hwm(Shaper = #lager_shaper{hwm = undefined}) ->
     {true, 0, Shaper};
-check_hwm(Shaper = #lager_shaper{mps = Mps, hwm = Hwm}) when Mps < Hwm ->
-    %% haven't hit high water mark yet, just log it
-    {true, 0, Shaper#lager_shaper{mps=Mps+1}};
+check_hwm(Shaper = #lager_shaper{mps = Mps, hwm = Hwm, lasttime = Last}) when Mps < Hwm ->
+    {M, S, _} = Now = os:timestamp(),
+    case Last of
+        {M, S, _} ->
+            {true, 0, Shaper#lager_shaper{mps=Mps+1}};
+        _ ->
+            %different second - reset mps
+            {true, 0, Shaper#lager_shaper{mps=1, lasttime = Now}}
+    end;
 check_hwm(Shaper = #lager_shaper{lasttime = Last, dropped = Drop}) ->
     %% are we still in the same second?
     {M, S, _} = Now = os:timestamp(),
@@ -527,7 +532,7 @@ check_hwm(Shaper = #lager_shaper{lasttime = Last, dropped = Drop}) ->
         _ ->
             erlang:cancel_timer(Shaper#lager_shaper.timer),
             %% different second, reset all counters and allow it
-            {true, Drop, Shaper#lager_shaper{dropped = 0, mps=1, lasttime = Now}}
+            {true, Drop, Shaper#lager_shaper{dropped = 0, mps=0, lasttime = Now}}
     end.
 
 should_flush(#lager_shaper{flush_queue = true, flush_threshold = 0}) ->
